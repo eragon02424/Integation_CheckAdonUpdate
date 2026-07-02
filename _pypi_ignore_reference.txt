@@ -1,10 +1,1 @@
-PYPI_IGNORE = {
-    # pip interne Flags und Metapakete
-    "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
-    "upgrade", "r", "q", "quiet", "user",
-    # Standard Python HTTP/Netzwerk Bibliotheken - updaten sich zu haeufig
-    # und sind nicht die Kernfunktion der Add-ons
-    "aiohttp", "requests", "urllib3", "httpx",
-    # Sonstige Standard-Bibliotheken
-    "certifi", "charset-normalizer", "idna",
-}
+deleted

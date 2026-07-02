@@ -1,14 +1,1 @@
-# Erkennt: pip install --no-cache-dir paketname oder pip install paketname==1.2.3
-PATTERN_PYPI = re.compile(
-    r'pip(?:3)? install\s+((?:--[\w-]+\s+)*)([^\s&|\\]+)'
-)
-PYPI_IGNORE = {
-    # pip interne Flags und Metapakete
-    "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
-    "upgrade", "r", "q", "quiet", "user",
-    # Standard HTTP/Netzwerk Bibliotheken - updaten sich zu haeufig
-    # und sind nicht die Kernfunktion der Add-ons
-    "aiohttp", "requests", "urllib3", "httpx",
-    # Sonstige Standard-Hilfsbibliotheken
-    "certifi", "charset-normalizer", "idna", "pyyaml", "python-dotenv",
-}
+deleted
