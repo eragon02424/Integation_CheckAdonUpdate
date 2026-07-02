@@ -31,6 +31,8 @@ async def async_setup_entry(
         for key in keys:
             new.append(AddonInstalledVersionSensor(coordinator, key))
             new.append(AddonLatestVersionSensor(coordinator, key))
+            new.append(AddonLastKnownAddonSensor(coordinator, key))
+            new.append(AddonLastKnownDockerSensor(coordinator, key))
             _LOGGER.debug("[AUC] Sensoren angelegt fuer: %s", key)
         async_add_entities(new)
         entities.extend(new)
@@ -59,6 +61,10 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.data.get(self._key, {})
 
     @property
+    def _stored(self) -> dict:
+        return self.coordinator._stored.get(self._key, {})
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         d = self._dep
         return {
@@ -74,7 +80,7 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
 
 
 class AddonInstalledVersionSensor(AddonBaseSensor):
-    """Zeigt die in config.yaml hinterlegte Add-on Version."""
+    """Aktuelle Add-on Version aus config.yaml."""
 
     @property
     def unique_id(self) -> str:
@@ -96,7 +102,7 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
 
 class AddonLatestVersionSensor(AddonBaseSensor):
-    """Zeigt die neueste verfuegbare upstream Docker Version."""
+    """Neueste verfuegbare upstream Docker Version."""
 
     @property
     def unique_id(self) -> str:
@@ -114,3 +120,47 @@ class AddonLatestVersionSensor(AddonBaseSensor):
     @property
     def icon(self) -> str:
         return "mdi:package-up" if self._dep.get("update_available") else "mdi:package-check"
+
+
+class AddonLastKnownAddonSensor(AddonBaseSensor):
+    """Letzte gespeicherte Add-on Version (aus Storage)."""
+
+    @property
+    def unique_id(self) -> str:
+        return f"auc_{self._key}_last_addon"
+
+    @property
+    def name(self) -> str:
+        d = self._dep
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Last Addon Version"
+
+    @property
+    def native_value(self) -> str | None:
+        v = self._stored.get("addon_version")
+        return v if v else None
+
+    @property
+    def icon(self) -> str:
+        return "mdi:history"
+
+
+class AddonLastKnownDockerSensor(AddonBaseSensor):
+    """Letzte gespeicherte upstream Docker Version (aus Storage)."""
+
+    @property
+    def unique_id(self) -> str:
+        return f"auc_{self._key}_last_docker"
+
+    @property
+    def name(self) -> str:
+        d = self._dep
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Last Docker Version"
+
+    @property
+    def native_value(self) -> str | None:
+        v = self._stored.get("upstream_version")
+        return v if v else None
+
+    @property
+    def icon(self) -> str:
+        return "mdi:history"
