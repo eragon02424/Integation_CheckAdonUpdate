@@ -43,8 +43,9 @@ PATTERN_DYNAMIC_API = re.compile(
 PATTERN_DYNAMIC_VAR = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/\$\{?\w+\}?/'
 )
+# Erkennt: pip install --no-cache-dir paketname oder pip install paketname==1.2.3
 PATTERN_PYPI = re.compile(
-    r'pip(?:3)? install[^\n]*?([\w][\w.-]+?)(?:==[\d][\d\.]*)?(?:\s|$|\\)'
+    r'pip(?:3)? install\s+((?:--[\w-]+\s+)*)([^\s&|\\]+)'
 )
 PYPI_IGNORE = {
     "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
@@ -175,8 +176,11 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return await self._gh_text(url)
 
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
+        """Externe Abhaengigkeiten aus Dockerfile extrahieren (GitHub + PyPI)."""
         results = []
         seen = set()
+
+        # GitHub Release Links
         for pattern in [PATTERN_FIXED, PATTERN_DYNAMIC_API, PATTERN_DYNAMIC_VAR]:
             for m in pattern.finditer(content):
                 gh_owner, gh_repo = m.group(1), m.group(2)
@@ -185,15 +189,18 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     seen.add(k)
                     _LOGGER.debug("[AUC] GitHub erkannt in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
                     results.append({"type": "github", "upstream_owner": gh_owner, "upstream_repo": gh_repo})
+
+        # PyPI pip install Pakete - group(2) ist der Paketname nach den Flags
         for m in PATTERN_PYPI.finditer(content):
-            pkg = m.group(1).strip().lower()
-            if pkg in PYPI_IGNORE or len(pkg) < 2:
+            pkg = m.group(2).strip().lower().split('==')[0]
+            if pkg in PYPI_IGNORE or len(pkg) < 2 or pkg.startswith('-'):
                 continue
             k = f"py:{pkg}"
             if k not in seen:
                 seen.add(k)
                 _LOGGER.debug("[AUC] PyPI erkannt in %s/%s: %s", repo, path, pkg)
                 results.append({"type": "pypi", "package": pkg})
+
         return results
 
     async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
@@ -317,7 +324,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     if dep_type == "github":
                         upstream_owner = dep["upstream_owner"]
                         upstream_repo = dep["upstream_repo"]
-                        # Sauberer Key ohne doppelten Typ-Prefix
                         key = f"{repo}__{df_path.replace('/', '_')}__gh__{upstream_owner}__{upstream_repo}"
                         source_label = f"{upstream_owner}/{upstream_repo}"
                         upstream_latest = await self._get_github_latest(upstream_owner, upstream_repo)
