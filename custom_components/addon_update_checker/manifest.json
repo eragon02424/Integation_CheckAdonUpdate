@@ -1,0 +1,12 @@
+{
+  "domain": "addon_update_checker",
+  "name": "Addon Update Checker",
+  "version": "1.0.0",
+  "documentation": "https://github.com/eragon02424/Integation_CheckAdonUpdate",
+  "issue_tracker": "https://github.com/eragon02424/Integation_CheckAdonUpdate/issues",
+  "codeowners": ["@eragon02424"],
+  "requirements": [],
+  "dependencies": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}

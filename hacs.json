@@ -1,0 +1,9 @@
+{
+  "name": "Addon Update Checker",
+  "domain": "addon_update_checker",
+  "documentation": "https://github.com/eragon02424/Integation_CheckAdonUpdate",
+  "issue_tracker": "https://github.com/eragon02424/Integation_CheckAdonUpdate/issues",
+  "codeowners": ["@eragon02424"],
+  "render_readme": true,
+  "homeassistant": "2024.1.0"
+}

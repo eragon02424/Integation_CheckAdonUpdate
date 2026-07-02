@@ -1,0 +1,31 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Addon Update Checker einrichten",
+        "description": "Gib deinen GitHub Username ein. Die Integration durchsucht automatisch alle Repos nach Dockerfiles mit externen GitHub Abhängigkeiten.\n\nScan-Intervall in Minuten (min: {min}, max: {max})",
+        "data": {
+          "github_username": "GitHub Username",
+          "scan_interval": "Scan-Intervall (Minuten)"
+        }
+      }
+    },
+    "error": {
+      "user_not_found": "GitHub User nicht gefunden",
+      "cannot_connect": "Verbindung zu GitHub fehlgeschlagen"
+    },
+    "abort": {
+      "already_configured": "Dieser GitHub User wird bereits überwacht"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Einstellungen anpassen",
+        "data": {
+          "scan_interval": "Scan-Intervall (Minuten)"
+        }
+      }
+    }
+  }
+}
