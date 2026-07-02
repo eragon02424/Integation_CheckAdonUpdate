@@ -85,14 +85,11 @@ class AddonUpdateCheckerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     def async_get_options_flow(config_entry):
-        return AddonUpdateCheckerOptionsFlow(config_entry)
+        return AddonUpdateCheckerOptionsFlow()
 
 
 class AddonUpdateCheckerOptionsFlow(config_entries.OptionsFlow):
     """Options Flow - Token und Intervall nachtraeglich aendern."""
-
-    def __init__(self, config_entry) -> None:
-        self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
         if user_input is not None:
