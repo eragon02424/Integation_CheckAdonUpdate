@@ -1,0 +1,7 @@
+PATTERN_PYPI = re.compile(
+    r'pip(?:3)? install\s+((?:--[\w-]+\s+)*)([^\s&|\\]+)'
+)
+PYPI_IGNORE = {
+    "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
+    "upgrade", "r", "q", "quiet", "user"
+}
