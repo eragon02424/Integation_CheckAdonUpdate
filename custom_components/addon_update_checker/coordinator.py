@@ -32,6 +32,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Alle externen GitHub Links erkennen - egal ob feste oder dynamische Version
 PATTERN_FIXED = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
@@ -152,20 +153,36 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return await self._gh_text(url)
 
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
+        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren.
+        Kein Unterschied mehr zwischen dynamisch und statisch - alles wird geprueft.
+        """
         results = []
+        seen = set()
+
         for m in PATTERN_FIXED.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            _LOGGER.debug("[AUC] Feste Version in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
-            results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": False})
+            key = f"{gh_owner}/{gh_repo}"
+            if key not in seen:
+                seen.add(key)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
+
         for m in PATTERN_DYNAMIC_API.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            _LOGGER.debug("[AUC] Dynamischer API-Link in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
-            results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": True})
+            key = f"{gh_owner}/{gh_repo}"
+            if key not in seen:
+                seen.add(key)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
+
         for m in PATTERN_DYNAMIC_VAR.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            if not any(r["upstream_owner"] == gh_owner and r["upstream_repo"] == gh_repo for r in results):
-                _LOGGER.debug("[AUC] Dynamische Variable in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
-                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": True})
+            key = f"{gh_owner}/{gh_repo}"
+            if key not in seen:
+                seen.add(key)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
+
         return results
 
     async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
@@ -196,11 +213,9 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return None
 
     def _notify(self, notif_id: str, title: str, message: str) -> None:
-        """Persistente HA Benachrichtigung erstellen."""
         pn_create(self.hass, message=message, title=title, notification_id=notif_id)
 
     def _dismiss(self, notif_id: str) -> None:
-        """Persistente HA Benachrichtigung entfernen."""
         pn_dismiss(self.hass, notification_id=notif_id)
 
     async def _async_update_data(self) -> dict:
@@ -243,7 +258,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                 for dep in deps:
                     upstream_owner = dep["upstream_owner"]
                     upstream_repo = dep["upstream_repo"]
-                    is_dynamic = dep["dynamic"]
 
                     key = f"{repo}__{df_path.replace('/', '_')}__{upstream_owner}__{upstream_repo}"
                     found_keys.add(key)
@@ -253,6 +267,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     stored = self._stored.get(key)
 
                     if stored is None:
+                        # Erster Fund - Baseline speichern, keine Warnung
                         _LOGGER.info(
                             "[AUC] ERSTER FUND (Baseline): %s/%s -> %s/%s | addon=%s upstream=%s",
                             repo, df_path, upstream_owner, upstream_repo, addon_version, upstream_latest
@@ -260,7 +275,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         self._stored[key] = {
                             "addon_version": addon_version,
                             "upstream_version": upstream_latest,
-                            "dynamic": is_dynamic,
                         }
                         status = "baseline"
                         update_available = False
@@ -272,6 +286,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         upstream_changed = upstream_latest and upstream_latest != last_upstream
 
                         if addon_changed:
+                            # Add-on wurde neu gebaut - alles aktualisieren, Warnung weg
                             _LOGGER.info(
                                 "[AUC] ADD-ON AKTUALISIERT: %s | addon %s -> %s | upstream %s",
                                 addon_name, last_addon, addon_version, upstream_latest
@@ -279,13 +294,13 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                             self._stored[key] = {
                                 "addon_version": addon_version,
                                 "upstream_version": upstream_latest,
-                                "dynamic": is_dynamic,
                             }
                             self._dismiss(notif_id)
                             status = "up_to_date"
                             update_available = False
 
-                        elif upstream_changed and not is_dynamic:
+                        elif upstream_changed:
+                            # Upstream hat Update, Add-on noch nicht - Warnung!
                             _LOGGER.warning(
                                 "[AUC] UPDATE VERFUEGBAR: %s | upstream %s -> %s (addon bleibt %s)",
                                 addon_name, last_upstream, upstream_latest, addon_version
@@ -305,16 +320,8 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                             status = "update_available"
                             update_available = True
 
-                        elif is_dynamic and upstream_changed:
-                            _LOGGER.info(
-                                "[AUC] Dynamisch, upstream geaendert: %s/%s upstream %s -> %s",
-                                repo, df_path, last_upstream, upstream_latest
-                            )
-                            self._stored[key]["upstream_version"] = upstream_latest
-                            status = "dynamic"
-                            update_available = False
-
                         else:
+                            # Alles aktuell
                             _LOGGER.debug(
                                 "[AUC] OK: %s | addon=%s upstream=%s",
                                 addon_name, addon_version, upstream_latest
@@ -333,11 +340,11 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         "upstream_repo": upstream_repo,
                         "addon_version": addon_version,
                         "upstream_latest": upstream_latest,
-                        "dynamic": is_dynamic,
                         "status": status,
                         "update_available": update_available,
                     }
 
+        # Nicht mehr vorhandene Eintraege entfernen
         removed = [k for k in list(self._stored.keys()) if k not in found_keys]
         for k in removed:
             _LOGGER.info("[AUC] Eintrag entfernt (Dockerfile weg): %s", k)
