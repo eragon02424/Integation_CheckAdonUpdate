@@ -32,7 +32,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Alle externen GitHub Links erkennen - egal ob feste oder dynamische Version
 PATTERN_FIXED = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
@@ -153,36 +152,30 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return await self._gh_text(url)
 
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
-        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren.
-        Kein Unterschied mehr zwischen dynamisch und statisch - alles wird geprueft.
-        """
+        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren."""
         results = []
         seen = set()
-
         for m in PATTERN_FIXED.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            key = f"{gh_owner}/{gh_repo}"
-            if key not in seen:
-                seen.add(key)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+            k = f"{gh_owner}/{gh_repo}"
+            if k not in seen:
+                seen.add(k)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
                 results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
-
         for m in PATTERN_DYNAMIC_API.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            key = f"{gh_owner}/{gh_repo}"
-            if key not in seen:
-                seen.add(key)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+            k = f"{gh_owner}/{gh_repo}"
+            if k not in seen:
+                seen.add(k)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
                 results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
-
         for m in PATTERN_DYNAMIC_VAR.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            key = f"{gh_owner}/{gh_repo}"
-            if key not in seen:
-                seen.add(key)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, key)
+            k = f"{gh_owner}/{gh_repo}"
+            if k not in seen:
+                seen.add(k)
+                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
                 results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
-
         return results
 
     async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
@@ -301,11 +294,12 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
                         elif upstream_changed:
                             # Upstream hat Update, Add-on noch nicht - Warnung!
+                            # Storage NICHT updaten - last_upstream bleibt als Referenz erhalten
+                            # bis das Add-on neu gebaut wird!
                             _LOGGER.warning(
                                 "[AUC] UPDATE VERFUEGBAR: %s | upstream %s -> %s (addon bleibt %s)",
                                 addon_name, last_upstream, upstream_latest, addon_version
                             )
-                            self._stored[key]["upstream_version"] = upstream_latest
                             self._notify(
                                 notif_id,
                                 f"\U0001f527 Add-on Update: {addon_name}",
@@ -344,7 +338,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         "update_available": update_available,
                     }
 
-        # Nicht mehr vorhandene Eintraege entfernen
         removed = [k for k in list(self._stored.keys()) if k not in found_keys]
         for k in removed:
             _LOGGER.info("[AUC] Eintrag entfernt (Dockerfile weg): %s", k)
