@@ -1,4 +1,4 @@
-"""Sensoren f\u00fcr Addon Update Checker."""
+"""Sensoren fuer Addon Update Checker."""
 from __future__ import annotations
 
 import logging
@@ -23,54 +23,60 @@ async def async_setup_entry(
 ) -> None:
     """Richtet Sensoren ein."""
     coordinator: AddonUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    known_keys: set[str] = set()
+    entities: list[AddonBaseSensor] = []
 
-    entities = []
-    for key, dep in coordinator.data.items():
-        entities.append(AddonInstalledVersionSensor(coordinator, key))
-        entities.append(AddonLatestVersionSensor(coordinator, key))
-        _LOGGER.debug("[AUC] Sensoren angelegt f\u00fcr: %s", key)
+    def _add_for_keys(keys: set[str]) -> None:
+        new = []
+        for key in keys:
+            new.append(AddonInstalledVersionSensor(coordinator, key))
+            new.append(AddonLatestVersionSensor(coordinator, key))
+            _LOGGER.debug("[AUC] Sensoren angelegt fuer: %s", key)
+        async_add_entities(new)
+        entities.extend(new)
+        known_keys.update(keys)
 
-    async_add_entities(entities)
+    # Initiale Sensoren
+    _add_for_keys(set(coordinator.data.keys()))
 
-    def _handle_coordinator_update() -> None:
-        new_keys = set(coordinator.data.keys()) - {e._key for e in entities if hasattr(e, '_key')}
+    # Dynamisch neue Sensoren hinzufuegen wenn neue Dockerfiles gefunden werden
+    def _on_update() -> None:
+        new_keys = set(coordinator.data.keys()) - known_keys
         if new_keys:
-            new_entities = []
-            for key in new_keys:
-                new_entities.append(AddonInstalledVersionSensor(coordinator, key))
-                new_entities.append(AddonLatestVersionSensor(coordinator, key))
-                _LOGGER.debug("[AUC] Neue Sensoren f\u00fcr neu erkanntes Dockerfile: %s", key)
-            async_add_entities(new_entities)
+            _LOGGER.debug("[AUC] Neue Dockerfiles erkannt, lege Sensoren an: %s", new_keys)
+            _add_for_keys(new_keys)
 
-    coordinator.async_add_listener(_handle_coordinator_update)
+    coordinator.async_add_listener(_on_update)
 
 
 class AddonBaseSensor(CoordinatorEntity, SensorEntity):
-    """Basis-Sensor."""
+    """Basis-Klasse fuer alle AUC Sensoren."""
 
     def __init__(self, coordinator: AddonUpdateCoordinator, key: str) -> None:
         super().__init__(coordinator)
         self._key = key
 
     @property
-    def _current_dep(self) -> dict:
+    def _dep(self) -> dict:
         return self.coordinator.data.get(self._key, {})
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        dep = self._current_dep
+        d = self._dep
         return {
-            "addon_repo": dep.get("addon_repo"),
-            "dockerfile_path": dep.get("dockerfile_path"),
-            "upstream": f"{dep.get('upstream_owner')}/{dep.get('upstream_repo')}",
-            "status": dep.get("status"),
-            "dynamic": dep.get("dynamic"),
-            "update_available": dep.get("update_available"),
+            "addon_repo": d.get("addon_repo"),
+            "addon_name": d.get("addon_name"),
+            "slug": d.get("slug"),
+            "dockerfile": d.get("dockerfile_path"),
+            "upstream": f"{d.get('upstream_owner')}/{d.get('upstream_repo')}",
+            "status": d.get("status"),
+            "dynamic": d.get("dynamic"),
+            "update_available": d.get("update_available"),
         }
 
 
 class AddonInstalledVersionSensor(AddonBaseSensor):
-    """Sensor f\u00fcr die aktuell im Dockerfile referenzierte Version."""
+    """Zeigt die in config.yaml hinterlegte Add-on Version."""
 
     @property
     def unique_id(self) -> str:
@@ -78,16 +84,13 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
     @property
     def name(self) -> str:
-        dep = self._current_dep
-        return f"AUC {dep.get('addon_repo', '')} {dep.get('upstream_repo', '')} Installed"
+        d = self._dep
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Installed"
 
     @property
     def native_value(self) -> str | None:
-        dep = self._current_dep
-        if dep.get("dynamic"):
-            # Dynamisch = l\u00e4dt immer latest beim Build, keine feste Version hinterlegt
-            return None
-        return dep.get("installed_version")
+        v = self._dep.get("addon_version")
+        return v if v else None
 
     @property
     def icon(self) -> str:
@@ -95,7 +98,7 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
 
 class AddonLatestVersionSensor(AddonBaseSensor):
-    """Sensor f\u00fcr die neueste verf\u00fcgbare upstream Version."""
+    """Zeigt die neueste verfuegbare upstream Version."""
 
     @property
     def unique_id(self) -> str:
@@ -103,16 +106,13 @@ class AddonLatestVersionSensor(AddonBaseSensor):
 
     @property
     def name(self) -> str:
-        dep = self._current_dep
-        return f"AUC {dep.get('addon_repo', '')} {dep.get('upstream_repo', '')} Latest"
+        d = self._dep
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Latest"
 
     @property
     def native_value(self) -> str | None:
-        return self._current_dep.get("upstream_latest")
+        return self._dep.get("upstream_latest")
 
     @property
     def icon(self) -> str:
-        dep = self._current_dep
-        if dep.get("update_available"):
-            return "mdi:package-up"
-        return "mdi:package-check"
+        return "mdi:package-up" if self._dep.get("update_available") else "mdi:package-check"

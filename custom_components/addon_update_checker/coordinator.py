@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator für Addon Update Checker."""
+"""DataUpdateCoordinator fuer Addon Update Checker."""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import Any
 
 import aiohttp
+import yaml
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -27,11 +28,15 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Regex Patterns
-PATTERN_FIXED_VERSION = re.compile(
-    r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*\d)/'
+# Regex: externe GitHub Release Links im Dockerfile erkennen
+# Unterstuetzt:
+#   https://github.com/owner/repo/releases/download/v1.2.3/...
+#   https://api.github.com/repos/owner/repo/releases/latest
+#   https://github.com/owner/repo/releases/download/${LATEST}/...
+PATTERN_FIXED = re.compile(
+    r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
-PATTERN_DYNAMIC_LATEST = re.compile(
+PATTERN_DYNAMIC_API = re.compile(
     r'https://api\.github\.com/repos/([\w.-]+)/([\w.-]+)/releases/latest'
 )
 PATTERN_DYNAMIC_VAR = re.compile(
@@ -43,14 +48,15 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
     """Koordiniert alle GitHub Scans und Versionsvergleiche."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialisierung."""
         self.github_username = entry.data[CONF_GITHUB_USERNAME]
         scan_minutes = entry.options.get(
             CONF_SCAN_INTERVAL,
             entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MINUTES)
         )
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        self._known_versions: dict[str, dict] = {}
+        # Gespeicherte Versionen: key -> {addon_version, upstream_version}
+        self._stored: dict[str, dict] = {}
+        self._store_loaded = False
         self.session = async_get_clientsession(hass)
 
         super().__init__(
@@ -60,282 +66,374 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=scan_minutes),
         )
         _LOGGER.debug(
-            "[AUC] Coordinator initialisiert: user=%s, intervall=%d min",
+            "[AUC] Coordinator init: user=%s, intervall=%d min",
             self.github_username, scan_minutes
         )
 
-    async def _async_load_stored_versions(self) -> None:
-        """Lädt gespeicherte Versionen aus HA Storage (überlebt Neustart)."""
-        stored = await self._store.async_load()
-        if stored:
-            self._known_versions = stored.get("versions", {})
-            _LOGGER.debug(
-                "[AUC] %d bekannte Einträge aus Storage geladen",
-                len(self._known_versions)
-            )
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    async def _load_store(self) -> None:
+        """Laedt gespeicherte Versionen aus HA Storage (ueberlebt Neustart)."""
+        data = await self._store.async_load()
+        if data:
+            self._stored = data.get("versions", {})
+            _LOGGER.debug("[AUC] Storage geladen: %d Eintraege", len(self._stored))
         else:
-            _LOGGER.debug("[AUC] Kein Storage gefunden, starte frisch")
+            _LOGGER.debug("[AUC] Kein Storage vorhanden, starte frisch")
+        self._store_loaded = True
 
-    async def _async_save_versions(self) -> None:
+    async def _save_store(self) -> None:
         """Speichert Versionen persistent."""
-        await self._store.async_save({"versions": self._known_versions})
+        await self._store.async_save({"versions": self._stored})
+        _LOGGER.debug("[AUC] Storage gespeichert: %d Eintraege", len(self._stored))
 
-    async def _github_get(self, url: str) -> Any:
-        """GitHub API GET mit Fehlerbehandlung."""
-        headers = {"User-Agent": "HA-AddonUpdateChecker/1.0",
-                   "Accept": "application/vnd.github+json"}
+    # ------------------------------------------------------------------
+    # GitHub HTTP Helpers
+    # ------------------------------------------------------------------
+
+    async def _gh_json(self, url: str) -> Any:
+        """GitHub API GET -> JSON."""
+        headers = {
+            "User-Agent": "HA-AddonUpdateChecker/1.0",
+            "Accept": "application/vnd.github+json",
+        }
         try:
-            async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self.session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                elif resp.status == 403:
-                    _LOGGER.warning("[AUC] GitHub Rate Limit erreicht bei %s", url)
+                if resp.status == 403:
+                    _LOGGER.warning("[AUC] GitHub Rate Limit bei %s", url)
                 elif resp.status == 404:
-                    _LOGGER.debug("[AUC] 404 - nicht gefunden: %s", url)
+                    _LOGGER.debug("[AUC] 404: %s", url)
                 else:
                     _LOGGER.warning("[AUC] HTTP %d bei %s", resp.status, url)
         except asyncio.TimeoutError:
-            _LOGGER.warning("[AUC] Timeout bei %s", url)
-        except aiohttp.ClientError as err:
-            _LOGGER.warning("[AUC] Verbindungsfehler bei %s: %s", url, err)
+            _LOGGER.warning("[AUC] Timeout: %s", url)
+        except aiohttp.ClientError as e:
+            _LOGGER.warning("[AUC] Verbindungsfehler %s: %s", url, e)
         return None
 
-    async def _github_get_text(self, url: str) -> str | None:
-        """GitHub RAW GET für Textdateien."""
+    async def _gh_text(self, url: str) -> str | None:
+        """GitHub RAW GET -> Text."""
         headers = {"User-Agent": "HA-AddonUpdateChecker/1.0"}
         try:
-            async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with self.session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
                 if resp.status == 200:
                     return await resp.text()
                 _LOGGER.debug("[AUC] HTTP %d bei RAW %s", resp.status, url)
-        except Exception as err:
-            _LOGGER.warning("[AUC] Fehler beim Lesen von %s: %s", url, err)
+        except Exception as e:
+            _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
 
-    async def _get_all_repos(self) -> list[dict]:
-        """Holt alle Repos des GitHub Users."""
-        _LOGGER.debug("[AUC] Scanne Repos von GitHub User: %s", self.github_username)
-        repos = []
-        page = 1
+    # ------------------------------------------------------------------
+    # GitHub Repo/Datei Zugriff
+    # ------------------------------------------------------------------
+
+    async def _get_repos(self) -> list[dict]:
+        """Alle Repos des GitHub Users holen."""
+        _LOGGER.debug("[AUC] Lade Repos von: %s", self.github_username)
+        repos, page = [], 1
         while True:
             url = f"{GITHUB_API_BASE}/users/{self.github_username}/repos?per_page=100&page={page}"
-            data = await self._github_get(url)
+            data = await self._gh_json(url)
             if not data:
                 break
             repos.extend(data)
+            _LOGGER.debug("[AUC] Seite %d: %d Repos geladen", page, len(data))
             if len(data) < 100:
                 break
             page += 1
-        _LOGGER.debug("[AUC] %d Repos gefunden für %s", len(repos), self.github_username)
+        _LOGGER.debug("[AUC] Gesamt %d Repos gefunden", len(repos))
         return repos
 
-    async def _find_dockerfiles_in_repo(self, owner: str, repo: str, branch: str) -> list[dict]:
-        """Sucht alle Dockerfiles in einem Repo rekursiv."""
-        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-        _LOGGER.debug("[AUC] Suche Dockerfiles in %s/%s (branch: %s)", owner, repo, branch)
-        data = await self._github_get(url)
+    async def _find_dockerfiles(self, repo: str, branch: str) -> list[str]:
+        """Alle Dockerfile-Pfade in einem Repo finden."""
+        url = f"{GITHUB_API_BASE}/repos/{self.github_username}/{repo}/git/trees/{branch}?recursive=1"
+        data = await self._gh_json(url)
         if not data:
             return []
-        found = []
-        for item in data.get("tree", []):
-            if item.get("type") == "blob" and item.get("path", "").endswith("Dockerfile"):
-                found.append({
-                    "repo": repo,
-                    "path": item["path"],
-                    "raw_url": f"{GITHUB_RAW_BASE}/{owner}/{repo}/{branch}/{item['path']}"
-                })
-        _LOGGER.debug("[AUC] %d Dockerfile(s) in %s/%s gefunden: %s",
-                      len(found), owner, repo, [f["path"] for f in found])
-        return found
+        paths = [
+            item["path"]
+            for item in data.get("tree", [])
+            if item.get("type") == "blob" and item["path"].endswith("Dockerfile")
+        ]
+        if paths:
+            _LOGGER.debug("[AUC] Dockerfiles in %s: %s", repo, paths)
+        return paths
 
-    async def _parse_dockerfile(self, raw_url: str, repo: str, path: str) -> list[dict]:
-        """Liest Dockerfile und extrahiert externe GitHub Abhängigkeiten."""
-        content = await self._github_get_text(raw_url)
-        if not content:
-            return []
+    async def _read_raw(self, repo: str, branch: str, path: str) -> str | None:
+        """Datei aus GitHub RAW lesen."""
+        url = f"{GITHUB_RAW_BASE}/{self.github_username}/{repo}/{branch}/{path}"
+        return await self._gh_text(url)
 
-        _LOGGER.debug("[AUC] Parse Dockerfile: %s/%s", repo, path)
+    # ------------------------------------------------------------------
+    # Dockerfile + config.yaml parsen
+    # ------------------------------------------------------------------
+
+    def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
+        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren."""
         results = []
 
-        # Pattern 1: Feste Version im Download Link
-        for match in PATTERN_FIXED_VERSION.finditer(content):
-            gh_owner, gh_repo, version = match.group(1), match.group(2), match.group(3)
+        # Feste Version
+        for m in PATTERN_FIXED.finditer(content):
+            gh_owner, gh_repo, version = m.group(1), m.group(2), m.group(3)
             _LOGGER.debug(
-                "[AUC] ✓ Feste Version erkannt in %s/%s: %s/%s@%s",
+                "[AUC] Feste Version in %s/%s: %s/%s @ %s",
                 repo, path, gh_owner, gh_repo, version
             )
             results.append({
-                "key": f"{repo}__{path.replace('/', '_')}__{gh_owner}__{gh_repo}",
-                "addon_repo": repo,
-                "dockerfile_path": path,
                 "upstream_owner": gh_owner,
                 "upstream_repo": gh_repo,
-                "installed_version": version,
                 "dynamic": False,
             })
 
-        # Pattern 2: Dynamisch via releases/latest API
-        for match in PATTERN_DYNAMIC_LATEST.finditer(content):
-            gh_owner, gh_repo = match.group(1), match.group(2)
+        # Dynamisch via API
+        for m in PATTERN_DYNAMIC_API.finditer(content):
+            gh_owner, gh_repo = m.group(1), m.group(2)
             _LOGGER.debug(
-                "[AUC] ~ Dynamischer Latest-Link erkannt in %s/%s: %s/%s (keine feste Version)",
+                "[AUC] Dynamischer API-Link in %s/%s: %s/%s",
                 repo, path, gh_owner, gh_repo
             )
             results.append({
-                "key": f"{repo}__{path.replace('/', '_')}__{gh_owner}__{gh_repo}",
-                "addon_repo": repo,
-                "dockerfile_path": path,
                 "upstream_owner": gh_owner,
                 "upstream_repo": gh_repo,
-                "installed_version": None,  # Unbekannt - lädt immer latest
                 "dynamic": True,
             })
 
-        # Pattern 3: Dynamisch via Variable
-        for match in PATTERN_DYNAMIC_VAR.finditer(content):
-            gh_owner, gh_repo = match.group(1), match.group(2)
-            _LOGGER.debug(
-                "[AUC] ~ Variable-Version erkannt in %s/%s: %s/%s",
-                repo, path, gh_owner, gh_repo
+        # Dynamisch via Variable
+        for m in PATTERN_DYNAMIC_VAR.finditer(content):
+            gh_owner, gh_repo = m.group(1), m.group(2)
+            # Nicht doppelt erfassen falls schon via API gefunden
+            already = any(
+                r["upstream_owner"] == gh_owner and r["upstream_repo"] == gh_repo
+                for r in results
             )
-            results.append({
-                "key": f"{repo}__{path.replace('/', '_')}__{gh_owner}__{gh_repo}",
-                "addon_repo": repo,
-                "dockerfile_path": path,
-                "upstream_owner": gh_owner,
-                "upstream_repo": gh_repo,
-                "installed_version": None,
-                "dynamic": True,
-            })
-
-        if not results:
-            _LOGGER.debug("[AUC] Keine externen GitHub Links in %s/%s", repo, path)
+            if not already:
+                _LOGGER.debug(
+                    "[AUC] Dynamische Variable in %s/%s: %s/%s",
+                    repo, path, gh_owner, gh_repo
+                )
+                results.append({
+                    "upstream_owner": gh_owner,
+                    "upstream_repo": gh_repo,
+                    "dynamic": True,
+                })
 
         return results
 
+    async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
+        """config.yaml im gleichen Ordner wie das Dockerfile lesen."""
+        folder = dockerfile_path.rsplit("/", 1)[0] if "/" in dockerfile_path else ""
+        config_path = f"{folder}/config.yaml" if folder else "config.yaml"
+        _LOGGER.debug("[AUC] Lese config.yaml: %s/%s", repo, config_path)
+        content = await self._read_raw(repo, branch, config_path)
+        if not content:
+            _LOGGER.debug("[AUC] Keine config.yaml gefunden bei %s/%s", repo, config_path)
+            return {}
+        try:
+            data = yaml.safe_load(content)
+            slug = data.get("slug", "")
+            version = str(data.get("version", ""))
+            name = data.get("name", slug)
+            _LOGGER.debug(
+                "[AUC] config.yaml gelesen: slug=%s, version=%s, name=%s",
+                slug, version, name
+            )
+            return {"slug": slug, "addon_version": version, "addon_name": name}
+        except Exception as e:
+            _LOGGER.warning("[AUC] Fehler beim Parsen von config.yaml: %s", e)
+            return {}
+
+    # ------------------------------------------------------------------
+    # Upstream Version
+    # ------------------------------------------------------------------
+
     async def _get_upstream_latest(self, owner: str, repo: str) -> str | None:
-        """Holt die neueste Release Version von upstream GitHub."""
+        """Neueste Release Version von upstream GitHub holen."""
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/releases/latest"
-        data = await self._github_get(url)
+        data = await self._gh_json(url)
         if data:
             tag = data.get("tag_name", "").lstrip("v")
             _LOGGER.debug("[AUC] Upstream %s/%s latest: %s", owner, repo, tag)
             return tag
         return None
 
+    # ------------------------------------------------------------------
+    # Benachrichtigungen
+    # ------------------------------------------------------------------
+
+    def _notify(self, notif_id: str, title: str, message: str) -> None:
+        self.hass.components.persistent_notification.async_create(
+            message=message, title=title, notification_id=notif_id
+        )
+
+    def _dismiss(self, notif_id: str) -> None:
+        self.hass.components.persistent_notification.async_dismiss(
+            notification_id=notif_id
+        )
+
+    # ------------------------------------------------------------------
+    # Haupt-Update
+    # ------------------------------------------------------------------
+
     async def _async_update_data(self) -> dict:
-        """Hauptfunktion - wird vom Coordinator stündlich aufgerufen."""
-        _LOGGER.debug("[AUC] ===== Starte Update-Scan =====")
+        """Wird vom Coordinator regelmaessig aufgerufen."""
+        _LOGGER.debug("[AUC] ===== Scan Start =====")
 
-        # Storage laden beim ersten Mal
-        if not self._known_versions:
-            await self._async_load_stored_versions()
+        if not self._store_loaded:
+            await self._load_store()
 
-        repos = await self._get_all_repos()
+        repos = await self._get_repos()
         if not repos:
             raise UpdateFailed("Konnte keine Repos abrufen")
 
-        # Alle Dockerfiles in allen Repos finden
-        all_dependencies: dict[str, dict] = {}
-        for repo_data in repos:
-            repo_name = repo_data["name"]
-            branch = repo_data.get("default_branch", "main")
-            dockerfiles = await self._find_dockerfiles_in_repo(
-                self.github_username, repo_name, branch
-            )
-            for df in dockerfiles:
-                deps = await self._parse_dockerfile(df["raw_url"], repo_name, df["path"])
-                for dep in deps:
-                    all_dependencies[dep["key"]] = dep
-
-        _LOGGER.debug("[AUC] Insgesamt %d externe Abhängigkeiten erkannt", len(all_dependencies))
-
-        # Nicht mehr vorhandene Einträge entfernen
-        removed = [k for k in self._known_versions if k not in all_dependencies]
-        for key in removed:
-            _LOGGER.info("[AUC] Eintrag entfernt (Dockerfile nicht mehr gefunden): %s", key)
-            del self._known_versions[key]
-
-        # Jede Abhängigkeit prüfen
         result: dict[str, dict] = {}
-        for key, dep in all_dependencies.items():
-            upstream_latest = await self._get_upstream_latest(
-                dep["upstream_owner"], dep["upstream_repo"]
-            )
-            installed = dep["installed_version"]
-            is_dynamic = dep["dynamic"]
-            known = self._known_versions.get(key)
+        found_keys: set[str] = set()
 
-            if is_dynamic:
-                # Dynamisches Dockerfile - immer latest, kein Versionsvergleich möglich
-                status = "dynamic"
-                update_available = False
-                if not known:
-                    _LOGGER.info(
-                        "[AUC] NEU (dynamisch) %s/%s → %s/%s lädt immer 'latest' (%s)",
-                        dep["addon_repo"], dep["dockerfile_path"],
-                        dep["upstream_owner"], dep["upstream_repo"], upstream_latest
-                    )
-                    self._known_versions[key] = {"latest": upstream_latest, "dynamic": True}
-            else:
-                # Feste Version - Vergleich möglich
-                if not known:
-                    # Erster Fund - Baseline, keine Warnung
-                    _LOGGER.info(
-                        "[AUC] NEU erkannt: %s/%s → %s/%s installiert=%s latest=%s (Baseline gesetzt)",
-                        dep["addon_repo"], dep["dockerfile_path"],
-                        dep["upstream_owner"], dep["upstream_repo"],
-                        installed, upstream_latest
-                    )
-                    self._known_versions[key] = {
-                        "installed": installed,
-                        "latest": upstream_latest,
-                        "dynamic": False
+        for repo_data in repos:
+            repo = repo_data["name"]
+            branch = repo_data.get("default_branch", "main")
+
+            dockerfile_paths = await self._find_dockerfiles(repo, branch)
+            if not dockerfile_paths:
+                continue
+
+            for df_path in dockerfile_paths:
+                dockerfile_content = await self._read_raw(repo, branch, df_path)
+                if not dockerfile_content:
+                    continue
+
+                deps = self._parse_dockerfile(dockerfile_content, repo, df_path)
+                if not deps:
+                    _LOGGER.debug("[AUC] Keine externen Links in %s/%s", repo, df_path)
+                    continue
+
+                # config.yaml lesen fuer slug + addon_version
+                cfg = await self._read_config_yaml(repo, branch, df_path)
+                addon_version = cfg.get("addon_version", "")
+                addon_name = cfg.get("addon_name", repo)
+                slug = cfg.get("slug", repo)
+
+                for dep in deps:
+                    upstream_owner = dep["upstream_owner"]
+                    upstream_repo = dep["upstream_repo"]
+                    is_dynamic = dep["dynamic"]
+
+                    key = f"{repo}__{df_path.replace('/', '_')}__{upstream_owner}__{upstream_repo}"
+                    found_keys.add(key)
+
+                    # Upstream latest holen
+                    upstream_latest = await self._get_upstream_latest(upstream_owner, upstream_repo)
+                    notif_id = f"auc_{key}"
+
+                    stored = self._stored.get(key)
+
+                    if stored is None:
+                        # Erster Fund - Baseline, keine Warnung
+                        _LOGGER.info(
+                            "[AUC] ERSTER FUND (Baseline): %s/%s -> %s/%s | addon=%s upstream=%s",
+                            repo, df_path, upstream_owner, upstream_repo,
+                            addon_version, upstream_latest
+                        )
+                        self._stored[key] = {
+                            "addon_version": addon_version,
+                            "upstream_version": upstream_latest,
+                            "dynamic": is_dynamic,
+                        }
+                        status = "baseline"
+                        update_available = False
+
+                    else:
+                        last_upstream = stored.get("upstream_version", "")
+                        last_addon = stored.get("addon_version", "")
+
+                        addon_changed = addon_version != last_addon
+                        upstream_changed = upstream_latest and upstream_latest != last_upstream
+
+                        if addon_changed:
+                            # Add-on wurde neu gebaut - Warnung zuruecksetzen, alles speichern
+                            _LOGGER.info(
+                                "[AUC] ADD-ON AKTUALISIERT: %s | addon %s -> %s | upstream %s",
+                                addon_name, last_addon, addon_version, upstream_latest
+                            )
+                            self._stored[key] = {
+                                "addon_version": addon_version,
+                                "upstream_version": upstream_latest,
+                                "dynamic": is_dynamic,
+                            }
+                            self._dismiss(notif_id)
+                            status = "up_to_date"
+                            update_available = False
+
+                        elif upstream_changed and not is_dynamic:
+                            # Upstream hat Update, Add-on noch nicht - Warnung!
+                            _LOGGER.warning(
+                                "[AUC] UPDATE VERFUEGBAR: %s/%s -> %s/%s: upstream %s -> %s (addon bleibt %s)",
+                                repo, df_path, upstream_owner, upstream_repo,
+                                last_upstream, upstream_latest, addon_version
+                            )
+                            self._stored[key]["upstream_version"] = upstream_latest
+                            self._notify(
+                                notif_id,
+                                f"\U0001f527 Add-on Update: {addon_name}",
+                                (
+                                    f"**{addon_name}** (`{slug}`) verwendet\n"
+                                    f"`{upstream_owner}/{upstream_repo}` in Version **{last_upstream}**,\n"
+                                    f"aber **{upstream_latest}** ist verfuegbar.\n\n"
+                                    f"Bitte Dockerfile anpassen und Add-on neu aufbauen.\n"
+                                    f"Diese Meldung verschwindet automatisch nach dem Update."
+                                ),
+                            )
+                            status = "update_available"
+                            update_available = True
+
+                        elif is_dynamic and upstream_changed:
+                            # Dynamisches Dockerfile - nur upstream speichern, keine Warnung
+                            _LOGGER.info(
+                                "[AUC] Dynamisch, upstream geaendert (kein Vergleich moeglich): %s/%s upstream %s -> %s",
+                                repo, df_path, last_upstream, upstream_latest
+                            )
+                            self._stored[key]["upstream_version"] = upstream_latest
+                            status = "dynamic"
+                            update_available = False
+
+                        else:
+                            _LOGGER.debug(
+                                "[AUC] OK: %s/%s -> %s/%s | addon=%s upstream=%s",
+                                repo, df_path, upstream_owner, upstream_repo,
+                                addon_version, upstream_latest
+                            )
+                            self._dismiss(notif_id)
+                            status = "up_to_date"
+                            update_available = False
+
+                    result[key] = {
+                        "key": key,
+                        "addon_repo": repo,
+                        "addon_name": addon_name,
+                        "slug": slug,
+                        "dockerfile_path": df_path,
+                        "upstream_owner": upstream_owner,
+                        "upstream_repo": upstream_repo,
+                        "addon_version": addon_version,
+                        "upstream_latest": upstream_latest,
+                        "dynamic": is_dynamic,
+                        "status": status,
+                        "update_available": update_available,
                     }
-                    status = "baseline"
-                    update_available = False
-                elif upstream_latest and upstream_latest != installed:
-                    # Update verfügbar!
-                    status = "update_available"
-                    update_available = True
-                    _LOGGER.warning(
-                        "[AUC] ⚠ UPDATE VERFÜGBAR: %s/%s → %s/%s: %s → %s",
-                        dep["addon_repo"], dep["dockerfile_path"],
-                        dep["upstream_owner"], dep["upstream_repo"],
-                        installed, upstream_latest
-                    )
-                    # HA persistente Benachrichtigung
-                    self.hass.components.persistent_notification.async_create(
-                        message=(
-                            f"**{dep['addon_repo']}/{dep['dockerfile_path']}** verwendet "
-                            f"`{dep['upstream_owner']}/{dep['upstream_repo']}` "
-                            f"in Version **{installed}**, aber **{upstream_latest}** ist verfügbar.\n\n"
-                            f"Bitte Dockerfile anpassen und Add-on neu aufbauen."
-                        ),
-                        title=f"🔧 Add-on Update: {dep['addon_repo']}",
-                        notification_id=f"auc_{key}",
-                    )
-                    self._known_versions[key]["latest"] = upstream_latest
-                else:
-                    status = "up_to_date"
-                    update_available = False
-                    _LOGGER.debug(
-                        "[AUC] ✓ Aktuell: %s/%s → %s/%s @ %s",
-                        dep["addon_repo"], dep["dockerfile_path"],
-                        dep["upstream_owner"], dep["upstream_repo"], installed
-                    )
-                    # Benachrichtigung wegräumen falls vorhanden
-                    self.hass.components.persistent_notification.async_dismiss(
-                        notification_id=f"auc_{key}"
-                    )
 
-            result[key] = {
-                **dep,
-                "upstream_latest": upstream_latest,
-                "status": status,
-                "update_available": update_available,
-            }
+        # Nicht mehr vorhandene Eintraege aus Storage entfernen
+        removed = [k for k in list(self._stored.keys()) if k not in found_keys]
+        for k in removed:
+            _LOGGER.info("[AUC] Eintrag entfernt (Dockerfile weg): %s", k)
+            del self._stored[k]
 
-        await self._async_save_versions()
-        _LOGGER.debug("[AUC] ===== Scan abgeschlossen: %d Einträge =====", len(result))
+        await self._save_store()
+        _LOGGER.debug("[AUC] ===== Scan Ende: %d Eintraege =====", len(result))
         return result
