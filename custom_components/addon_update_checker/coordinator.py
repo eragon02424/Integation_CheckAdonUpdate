@@ -20,18 +20,21 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_GITHUB_TOKEN,
     CONF_GITHUB_USERNAME,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DOMAIN,
     GITHUB_API_BASE,
     GITHUB_RAW_BASE,
+    PYPI_API_BASE,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# GitHub Release Patterns
 PATTERN_FIXED = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
@@ -42,12 +45,23 @@ PATTERN_DYNAMIC_VAR = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/\$\{?\w+\}?/'
 )
 
+# PyPI Pattern: pip install paketname oder pip install paketname==1.2.3
+PATTERN_PYPI = re.compile(
+    r'pip(?:3)? install[^\n]*?([\w][\w.-]+?)(?:==[\d][\d\.]*)?(?:\s|$|\\)'
+)
+# Pakete die wir ignorieren (Standard Python Pakete)
+PYPI_IGNORE = {
+    "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
+    "upgrade", "r", "q", "quiet", "user"
+}
+
 
 class AddonUpdateCoordinator(DataUpdateCoordinator):
     """Koordiniert alle GitHub Scans und Versionsvergleiche."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.github_username = entry.data[CONF_GITHUB_USERNAME]
+        self.github_token = entry.data.get(CONF_GITHUB_TOKEN, "").strip()
         scan_minutes = entry.options.get(
             CONF_SCAN_INTERVAL,
             entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MINUTES)
@@ -63,10 +77,15 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=timedelta(minutes=scan_minutes),
         )
+        auth_info = "mit Token" if self.github_token else "OHNE Token (Rate Limit: 60/h)"
         _LOGGER.debug(
-            "[AUC] Coordinator init: user=%s, intervall=%d min",
-            self.github_username, scan_minutes
+            "[AUC] Coordinator init: user=%s, intervall=%d min, auth=%s",
+            self.github_username, scan_minutes, auth_info
         )
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
 
     async def _load_store(self) -> None:
         data = await self._store.async_load()
@@ -81,19 +100,30 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         await self._store.async_save({"versions": self._stored})
         _LOGGER.debug("[AUC] Storage gespeichert: %d Eintraege", len(self._stored))
 
-    async def _gh_json(self, url: str) -> Any:
+    # ------------------------------------------------------------------
+    # HTTP Helpers
+    # ------------------------------------------------------------------
+
+    def _github_headers(self) -> dict:
         headers = {
             "User-Agent": "HA-AddonUpdateChecker/1.0",
             "Accept": "application/vnd.github+json",
         }
+        if self.github_token:
+            headers["Authorization"] = f"Bearer {self.github_token}"
+        return headers
+
+    async def _gh_json(self, url: str) -> Any:
         try:
             async with self.session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                url, headers=self._github_headers(), timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 if resp.status == 403:
                     _LOGGER.warning("[AUC] GitHub Rate Limit bei %s", url)
+                elif resp.status == 401:
+                    _LOGGER.error("[AUC] GitHub Token ungueltig! Bitte Token pruefen.")
                 elif resp.status == 404:
                     _LOGGER.debug("[AUC] 404: %s", url)
                 else:
@@ -105,10 +135,11 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return None
 
     async def _gh_text(self, url: str) -> str | None:
-        headers = {"User-Agent": "HA-AddonUpdateChecker/1.0"}
         try:
             async with self.session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                url,
+                headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
+                timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
                     return await resp.text()
@@ -116,6 +147,24 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
+
+    async def _pypi_json(self, url: str) -> Any:
+        try:
+            async with self.session.get(
+                url,
+                headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                _LOGGER.debug("[AUC] PyPI HTTP %d bei %s", resp.status, url)
+        except Exception as e:
+            _LOGGER.warning("[AUC] PyPI Fehler bei %s: %s", url, e)
+        return None
+
+    # ------------------------------------------------------------------
+    # GitHub Repo/Datei Zugriff
+    # ------------------------------------------------------------------
 
     async def _get_repos(self) -> list[dict]:
         _LOGGER.debug("[AUC] Lade Repos von: %s", self.github_username)
@@ -126,11 +175,11 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             if not data:
                 break
             repos.extend(data)
-            _LOGGER.debug("[AUC] Seite %d: %d Repos geladen", page, len(data))
+            _LOGGER.debug("[AUC] Seite %d: %d Repos", page, len(data))
             if len(data) < 100:
                 break
             page += 1
-        _LOGGER.debug("[AUC] Gesamt %d Repos gefunden", len(repos))
+        _LOGGER.debug("[AUC] Gesamt %d Repos", len(repos))
         return repos
 
     async def _find_dockerfiles(self, repo: str, branch: str) -> list[str]:
@@ -151,37 +200,48 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         url = f"{GITHUB_RAW_BASE}/{self.github_username}/{repo}/{branch}/{path}"
         return await self._gh_text(url)
 
+    # ------------------------------------------------------------------
+    # Dockerfile parsen
+    # ------------------------------------------------------------------
+
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
-        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren."""
+        """Externe Abhaengigkeiten aus Dockerfile extrahieren (GitHub + PyPI)."""
         results = []
         seen = set()
-        for m in PATTERN_FIXED.finditer(content):
-            gh_owner, gh_repo = m.group(1), m.group(2)
-            k = f"{gh_owner}/{gh_repo}"
+
+        # GitHub Release Links
+        for pattern in [PATTERN_FIXED, PATTERN_DYNAMIC_API, PATTERN_DYNAMIC_VAR]:
+            for m in pattern.finditer(content):
+                gh_owner, gh_repo = m.group(1), m.group(2)
+                k = f"github:{gh_owner}/{gh_repo}"
+                if k not in seen:
+                    seen.add(k)
+                    _LOGGER.debug("[AUC] GitHub erkannt in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
+                    results.append({
+                        "type": "github",
+                        "upstream_owner": gh_owner,
+                        "upstream_repo": gh_repo,
+                    })
+
+        # PyPI pip install Pakete
+        for m in PATTERN_PYPI.finditer(content):
+            pkg = m.group(1).strip().lower()
+            if pkg in PYPI_IGNORE or len(pkg) < 2:
+                continue
+            k = f"pypi:{pkg}"
             if k not in seen:
                 seen.add(k)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
-                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
-        for m in PATTERN_DYNAMIC_API.finditer(content):
-            gh_owner, gh_repo = m.group(1), m.group(2)
-            k = f"{gh_owner}/{gh_repo}"
-            if k not in seen:
-                seen.add(k)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
-                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
-        for m in PATTERN_DYNAMIC_VAR.finditer(content):
-            gh_owner, gh_repo = m.group(1), m.group(2)
-            k = f"{gh_owner}/{gh_repo}"
-            if k not in seen:
-                seen.add(k)
-                _LOGGER.debug("[AUC] Erkannt in %s/%s: %s", repo, path, k)
-                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo})
+                _LOGGER.debug("[AUC] PyPI erkannt in %s/%s: %s", repo, path, pkg)
+                results.append({
+                    "type": "pypi",
+                    "package": pkg,
+                })
+
         return results
 
     async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
         folder = dockerfile_path.rsplit("/", 1)[0] if "/" in dockerfile_path else ""
         config_path = f"{folder}/config.yaml" if folder else "config.yaml"
-        _LOGGER.debug("[AUC] Lese config.yaml: %s/%s", repo, config_path)
         content = await self._read_raw(repo, branch, config_path)
         if not content:
             return {}
@@ -196,20 +256,107 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[AUC] Fehler beim Parsen von config.yaml: %s", e)
             return {}
 
-    async def _get_upstream_latest(self, owner: str, repo: str) -> str | None:
+    # ------------------------------------------------------------------
+    # Upstream Versionen abfragen
+    # ------------------------------------------------------------------
+
+    async def _get_github_latest(self, owner: str, repo: str) -> str | None:
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/releases/latest"
         data = await self._gh_json(url)
         if data:
             tag = data.get("tag_name", "").lstrip("v")
-            _LOGGER.debug("[AUC] Upstream %s/%s latest: %s", owner, repo, tag)
+            _LOGGER.debug("[AUC] GitHub %s/%s latest: %s", owner, repo, tag)
             return tag
         return None
+
+    async def _get_pypi_latest(self, package: str) -> str | None:
+        url = f"{PYPI_API_BASE}/{package}/json"
+        data = await self._pypi_json(url)
+        if data:
+            version = data.get("info", {}).get("version", "")
+            _LOGGER.debug("[AUC] PyPI %s latest: %s", package, version)
+            return version
+        return None
+
+    # ------------------------------------------------------------------
+    # Benachrichtigungen
+    # ------------------------------------------------------------------
 
     def _notify(self, notif_id: str, title: str, message: str) -> None:
         pn_create(self.hass, message=message, title=title, notification_id=notif_id)
 
     def _dismiss(self, notif_id: str) -> None:
         pn_dismiss(self.hass, notification_id=notif_id)
+
+    # ------------------------------------------------------------------
+    # Versionsvergleich (gemeinsame Logik fuer GitHub + PyPI)
+    # ------------------------------------------------------------------
+
+    def _process_dep(
+        self, key: str, notif_id: str, addon_name: str, slug: str,
+        source_label: str, addon_version: str, upstream_latest: str | None
+    ) -> tuple[str, bool]:
+        """Vergleicht Versionen und gibt (status, update_available) zurueck."""
+        stored = self._stored.get(key)
+
+        if stored is None:
+            _LOGGER.info(
+                "[AUC] ERSTER FUND (Baseline): %s | addon=%s upstream=%s",
+                key, addon_version, upstream_latest
+            )
+            self._stored[key] = {
+                "addon_version": addon_version,
+                "upstream_version": upstream_latest,
+            }
+            return "baseline", False
+
+        last_upstream = stored.get("upstream_version", "")
+        last_addon = stored.get("addon_version", "")
+        addon_changed = addon_version != last_addon
+        upstream_changed = upstream_latest and upstream_latest != last_upstream
+
+        if addon_changed:
+            _LOGGER.info(
+                "[AUC] ADD-ON AKTUALISIERT: %s | addon %s -> %s | upstream %s",
+                addon_name, last_addon, addon_version, upstream_latest
+            )
+            self._stored[key] = {
+                "addon_version": addon_version,
+                "upstream_version": upstream_latest,
+            }
+            self._dismiss(notif_id)
+            return "up_to_date", False
+
+        elif upstream_changed:
+            _LOGGER.warning(
+                "[AUC] UPDATE VERFUEGBAR: %s | %s: %s -> %s (addon bleibt %s)",
+                addon_name, source_label, last_upstream, upstream_latest, addon_version
+            )
+            # Storage NICHT updaten - bleibt als Referenz bis Add-on neu gebaut wird
+            self._notify(
+                notif_id,
+                f"\U0001f527 Add-on Update: {addon_name}",
+                (
+                    f"**{addon_name}** (`{slug}`) verwendet\n"
+                    f"`{source_label}` in Version **{last_upstream}**,\n"
+                    f"aber **{upstream_latest}** ist verfuegbar.\n\n"
+                    f"Bitte Dockerfile anpassen und Add-on neu aufbauen.\n"
+                    f"Diese Meldung verschwindet automatisch nach dem Update."
+                ),
+            )
+            return "update_available", True
+
+        else:
+            _LOGGER.debug(
+                "[AUC] OK: %s | addon=%s upstream=%s",
+                addon_name, addon_version, upstream_latest
+            )
+            self._dismiss(notif_id)
+            return "up_to_date", False
+
+    # ------------------------------------------------------------------
+    # Haupt-Update
+    # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict:
         """Wird vom Coordinator regelmaessig aufgerufen."""
@@ -249,89 +396,40 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                 slug = cfg.get("slug", repo)
 
                 for dep in deps:
-                    upstream_owner = dep["upstream_owner"]
-                    upstream_repo = dep["upstream_repo"]
+                    dep_type = dep["type"]
 
-                    key = f"{repo}__{df_path.replace('/', '_')}__{upstream_owner}__{upstream_repo}"
-                    found_keys.add(key)
+                    if dep_type == "github":
+                        upstream_owner = dep["upstream_owner"]
+                        upstream_repo = dep["upstream_repo"]
+                        key = f"{repo}__{df_path.replace('/', '_')}__github__{upstream_owner}__{upstream_repo}"
+                        source_label = f"{upstream_owner}/{upstream_repo}"
+                        upstream_latest = await self._get_github_latest(upstream_owner, upstream_repo)
 
-                    upstream_latest = await self._get_upstream_latest(upstream_owner, upstream_repo)
-                    notif_id = f"auc_{key}"
-                    stored = self._stored.get(key)
-
-                    if stored is None:
-                        # Erster Fund - Baseline speichern, keine Warnung
-                        _LOGGER.info(
-                            "[AUC] ERSTER FUND (Baseline): %s/%s -> %s/%s | addon=%s upstream=%s",
-                            repo, df_path, upstream_owner, upstream_repo, addon_version, upstream_latest
-                        )
-                        self._stored[key] = {
-                            "addon_version": addon_version,
-                            "upstream_version": upstream_latest,
-                        }
-                        status = "baseline"
-                        update_available = False
+                    elif dep_type == "pypi":
+                        package = dep["package"]
+                        key = f"{repo}__{df_path.replace('/', '_')}__pypi__{package}"
+                        source_label = f"pypi:{package}"
+                        upstream_latest = await self._get_pypi_latest(package)
 
                     else:
-                        last_upstream = stored.get("upstream_version", "")
-                        last_addon = stored.get("addon_version", "")
-                        addon_changed = addon_version != last_addon
-                        upstream_changed = upstream_latest and upstream_latest != last_upstream
+                        continue
 
-                        if addon_changed:
-                            # Add-on wurde neu gebaut - alles aktualisieren, Warnung weg
-                            _LOGGER.info(
-                                "[AUC] ADD-ON AKTUALISIERT: %s | addon %s -> %s | upstream %s",
-                                addon_name, last_addon, addon_version, upstream_latest
-                            )
-                            self._stored[key] = {
-                                "addon_version": addon_version,
-                                "upstream_version": upstream_latest,
-                            }
-                            self._dismiss(notif_id)
-                            status = "up_to_date"
-                            update_available = False
+                    found_keys.add(key)
+                    notif_id = f"auc_{key}"
 
-                        elif upstream_changed:
-                            # Upstream hat Update, Add-on noch nicht - Warnung!
-                            # Storage NICHT updaten - last_upstream bleibt als Referenz erhalten
-                            # bis das Add-on neu gebaut wird!
-                            _LOGGER.warning(
-                                "[AUC] UPDATE VERFUEGBAR: %s | upstream %s -> %s (addon bleibt %s)",
-                                addon_name, last_upstream, upstream_latest, addon_version
-                            )
-                            self._notify(
-                                notif_id,
-                                f"\U0001f527 Add-on Update: {addon_name}",
-                                (
-                                    f"**{addon_name}** (`{slug}`) verwendet\n"
-                                    f"`{upstream_owner}/{upstream_repo}` in Version **{last_upstream}**,\n"
-                                    f"aber **{upstream_latest}** ist verfuegbar.\n\n"
-                                    f"Bitte Dockerfile anpassen und Add-on neu aufbauen.\n"
-                                    f"Diese Meldung verschwindet automatisch nach dem Update."
-                                ),
-                            )
-                            status = "update_available"
-                            update_available = True
-
-                        else:
-                            # Alles aktuell
-                            _LOGGER.debug(
-                                "[AUC] OK: %s | addon=%s upstream=%s",
-                                addon_name, addon_version, upstream_latest
-                            )
-                            self._dismiss(notif_id)
-                            status = "up_to_date"
-                            update_available = False
+                    status, update_available = self._process_dep(
+                        key, notif_id, addon_name, slug,
+                        source_label, addon_version, upstream_latest
+                    )
 
                     result[key] = {
                         "key": key,
+                        "type": dep_type,
                         "addon_repo": repo,
                         "addon_name": addon_name,
                         "slug": slug,
                         "dockerfile_path": df_path,
-                        "upstream_owner": upstream_owner,
-                        "upstream_repo": upstream_repo,
+                        "source_label": source_label,
                         "addon_version": addon_version,
                         "upstream_latest": upstream_latest,
                         "status": status,

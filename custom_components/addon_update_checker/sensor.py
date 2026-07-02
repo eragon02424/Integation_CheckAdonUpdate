@@ -21,10 +21,9 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Richtet Sensoren ein."""
     coordinator: AddonUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
     known_keys: set[str] = set()
-    entities: list[AddonBaseSensor] = []
+    entities: list = []
 
     def _add_for_keys(keys: set[str]) -> None:
         new = []
@@ -43,15 +42,12 @@ async def async_setup_entry(
     def _on_update() -> None:
         new_keys = set(coordinator.data.keys()) - known_keys
         if new_keys:
-            _LOGGER.debug("[AUC] Neue Dockerfiles erkannt, lege Sensoren an: %s", new_keys)
             _add_for_keys(new_keys)
 
     coordinator.async_add_listener(_on_update)
 
 
 class AddonBaseSensor(CoordinatorEntity, SensorEntity):
-    """Basis-Klasse fuer alle AUC Sensoren."""
-
     def __init__(self, coordinator: AddonUpdateCoordinator, key: str) -> None:
         super().__init__(coordinator)
         self._key = key
@@ -72,16 +68,14 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
             "addon_name": d.get("addon_name"),
             "slug": d.get("slug"),
             "dockerfile": d.get("dockerfile_path"),
-            "upstream": f"{d.get('upstream_owner')}/{d.get('upstream_repo')}",
+            "source": d.get("source_label"),
+            "type": d.get("type"),
             "status": d.get("status"),
-            "dynamic": d.get("dynamic"),
             "update_available": d.get("update_available"),
         }
 
 
 class AddonInstalledVersionSensor(AddonBaseSensor):
-    """Aktuelle Add-on Version aus config.yaml."""
-
     @property
     def unique_id(self) -> str:
         return f"auc_{self._key}_installed"
@@ -102,8 +96,6 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
 
 class AddonLatestVersionSensor(AddonBaseSensor):
-    """Neueste verfuegbare upstream Docker Version."""
-
     @property
     def unique_id(self) -> str:
         return f"auc_{self._key}_latest"
@@ -111,7 +103,8 @@ class AddonLatestVersionSensor(AddonBaseSensor):
     @property
     def name(self) -> str:
         d = self._dep
-        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Docker Version"
+        src = d.get('source_label', '')
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Docker Version ({src})"
 
     @property
     def native_value(self) -> str | None:
@@ -123,8 +116,6 @@ class AddonLatestVersionSensor(AddonBaseSensor):
 
 
 class AddonLastKnownAddonSensor(AddonBaseSensor):
-    """Letzte gespeicherte Add-on Version (aus Storage)."""
-
     @property
     def unique_id(self) -> str:
         return f"auc_{self._key}_last_addon"
@@ -145,8 +136,6 @@ class AddonLastKnownAddonSensor(AddonBaseSensor):
 
 
 class AddonLastKnownDockerSensor(AddonBaseSensor):
-    """Letzte gespeicherte upstream Docker Version (aus Storage)."""
-
     @property
     def unique_id(self) -> str:
         return f"auc_{self._key}_last_docker"

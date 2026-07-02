@@ -1,4 +1,4 @@
-"""Config Flow für Addon Update Checker."""
+"""Config Flow fuer Addon Update Checker."""
 from __future__ import annotations
 
 import logging
@@ -9,6 +9,7 @@ from homeassistant import config_entries
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
+    CONF_GITHUB_TOKEN,
     CONF_GITHUB_USERNAME,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL_MINUTES,
@@ -27,50 +28,52 @@ class AddonUpdateCheckerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     async def async_step_user(self, user_input=None):
-        """Erster Schritt: GitHub Username eingeben."""
         errors = {}
 
         if user_input is not None:
             username = user_input[CONF_GITHUB_USERNAME].strip()
+            token = user_input.get(CONF_GITHUB_TOKEN, "").strip()
             scan_interval = user_input[CONF_SCAN_INTERVAL]
 
-            # Prüfen ob GitHub User existiert
             session = async_get_clientsession(self.hass)
+            headers = {"User-Agent": "HA-AddonUpdateChecker/1.0"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
             try:
                 async with session.get(
                     f"{GITHUB_API_BASE}/users/{username}",
-                    headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
+                    headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 404:
                         errors[CONF_GITHUB_USERNAME] = "user_not_found"
+                    elif resp.status == 401:
+                        errors[CONF_GITHUB_TOKEN] = "token_invalid"
                     elif resp.status != 200:
                         errors["base"] = "cannot_connect"
             except Exception:
                 errors["base"] = "cannot_connect"
 
             if not errors:
-                # Eindeutige ID damit man den gleichen User nicht zweimal hinzufügt
                 await self.async_set_unique_id(username.lower())
                 self._abort_if_unique_id_configured()
-
-                _LOGGER.debug(
-                    "[AUC] Config Flow abgeschlossen: user=%s, intervall=%d min",
-                    username, scan_interval
-                )
+                _LOGGER.debug("[AUC] Config Flow OK: user=%s, token=%s, intervall=%d",
+                              username, "ja" if token else "nein", scan_interval)
                 return self.async_create_entry(
                     title=f"GitHub: {username}",
                     data={
                         CONF_GITHUB_USERNAME: username,
+                        CONF_GITHUB_TOKEN: token,
                         CONF_SCAN_INTERVAL: scan_interval,
                     },
                 )
 
         schema = vol.Schema({
             vol.Required(CONF_GITHUB_USERNAME, default="eragon02424"): str,
+            vol.Optional(CONF_GITHUB_TOKEN, default=""): str,
             vol.Required(CONF_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL_MINUTES): vol.All(
-                int,
-                vol.Range(min=MIN_SCAN_INTERVAL_MINUTES, max=MAX_SCAN_INTERVAL_MINUTES)
+                int, vol.Range(min=MIN_SCAN_INTERVAL_MINUTES, max=MAX_SCAN_INTERVAL_MINUTES)
             ),
         })
 
@@ -78,26 +81,20 @@ class AddonUpdateCheckerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=schema,
             errors=errors,
-            description_placeholders={
-                "min": str(MIN_SCAN_INTERVAL_MINUTES),
-                "max": str(MAX_SCAN_INTERVAL_MINUTES),
-            }
         )
 
     @staticmethod
     def async_get_options_flow(config_entry):
-        """Options Flow für nachträgliche Änderungen (z.B. Intervall)."""
         return AddonUpdateCheckerOptionsFlow(config_entry)
 
 
 class AddonUpdateCheckerOptionsFlow(config_entries.OptionsFlow):
-    """Options Flow - Intervall nachträglich ändern."""
+    """Options Flow - Token und Intervall nachtraeglich aendern."""
 
     def __init__(self, config_entry) -> None:
         self.config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
-        """Intervall ändern."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
@@ -105,11 +102,15 @@ class AddonUpdateCheckerOptionsFlow(config_entries.OptionsFlow):
             CONF_SCAN_INTERVAL,
             self.config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MINUTES)
         )
+        current_token = self.config_entry.options.get(
+            CONF_GITHUB_TOKEN,
+            self.config_entry.data.get(CONF_GITHUB_TOKEN, "")
+        )
 
         schema = vol.Schema({
+            vol.Optional(CONF_GITHUB_TOKEN, default=current_token): str,
             vol.Required(CONF_SCAN_INTERVAL, default=current_interval): vol.All(
-                int,
-                vol.Range(min=MIN_SCAN_INTERVAL_MINUTES, max=MAX_SCAN_INTERVAL_MINUTES)
+                int, vol.Range(min=MIN_SCAN_INTERVAL_MINUTES, max=MAX_SCAN_INTERVAL_MINUTES)
             ),
         })
 

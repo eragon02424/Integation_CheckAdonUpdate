@@ -3,27 +3,30 @@
     "step": {
       "user": {
         "title": "Addon Update Checker einrichten",
-        "description": "Gib deinen GitHub Username ein. Die Integration durchsucht automatisch alle Repos nach Dockerfiles mit externen GitHub Abh\u00e4ngigkeiten.\n\nScan-Intervall: 1 = 1 Minute, 60 = 1 Stunde, 1440 = 24 Stunden (empfohlen)\nZum Testen: 1 eingeben",
+        "description": "Gibt deinen GitHub Username ein und optional einen Personal Access Token (PAT) fuer hoehere Rate Limits (60/h ohne Token, 5000/h mit Token).\n\nToken erstellen: GitHub → Settings → Developer settings → Personal access tokens → Fine-grained token (nur 'Public Repositories' Read-only noetig)\n\nScan-Intervall: 1 = 1 Minute, 60 = 1 Stunde, 1440 = 24 Stunden",
         "data": {
           "github_username": "GitHub Username",
+          "github_token": "GitHub Token (optional, empfohlen)",
           "scan_interval": "Scan-Intervall (1 Min = 1, 1 Std = 60, 24 Std = 1440)"
         }
       }
     },
     "error": {
       "user_not_found": "GitHub User nicht gefunden",
+      "token_invalid": "GitHub Token ungueltig",
       "cannot_connect": "Verbindung zu GitHub fehlgeschlagen"
     },
     "abort": {
-      "already_configured": "Dieser GitHub User wird bereits \u00fcberwacht"
+      "already_configured": "Dieser GitHub User wird bereits ueberwacht"
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Einstellungen anpassen",
-        "description": "Scan-Intervall: 1 = 1 Minute, 60 = 1 Stunde, 1440 = 24 Stunden (empfohlen)",
+        "description": "Token aendern oder Scan-Intervall anpassen.",
         "data": {
+          "github_token": "GitHub Token (optional)",
           "scan_interval": "Scan-Intervall (1 Min = 1, 1 Std = 60, 24 Std = 1440)"
         }
       }
