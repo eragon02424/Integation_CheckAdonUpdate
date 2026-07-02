@@ -48,8 +48,13 @@ PATTERN_PYPI = re.compile(
     r'pip(?:3)? install\s+((?:--[\w-]+\s+)*)([^\s&|\\]+)'
 )
 PYPI_IGNORE = {
+    # pip Flags und Metapakete
     "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
-    "upgrade", "r", "q", "quiet", "user"
+    "upgrade", "r", "q", "quiet", "user",
+    # Standard HTTP/Netzwerk Libs - updaten sich zu haeufig, nicht Kernfunktion
+    "aiohttp", "requests", "urllib3", "httpx",
+    # Sonstige Standard-Hilfsbibliotheken
+    "certifi", "charset-normalizer", "idna", "pyyaml",
 }
 
 
@@ -180,7 +185,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         results = []
         seen = set()
 
-        # GitHub Release Links
         for pattern in [PATTERN_FIXED, PATTERN_DYNAMIC_API, PATTERN_DYNAMIC_VAR]:
             for m in pattern.finditer(content):
                 gh_owner, gh_repo = m.group(1), m.group(2)
@@ -190,7 +194,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("[AUC] GitHub erkannt in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
                     results.append({"type": "github", "upstream_owner": gh_owner, "upstream_repo": gh_repo})
 
-        # PyPI pip install Pakete - group(2) ist der Paketname nach den Flags
         for m in PATTERN_PYPI.finditer(content):
             pkg = m.group(2).strip().lower().split('==')[0]
             if pkg in PYPI_IGNORE or len(pkg) < 2 or pkg.startswith('-'):
