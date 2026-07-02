@@ -1,4 +1,4 @@
-"""Sensoren für Addon Update Checker."""
+"""Sensoren f\u00fcr Addon Update Checker."""
 from __future__ import annotations
 
 import logging
@@ -28,11 +28,10 @@ async def async_setup_entry(
     for key, dep in coordinator.data.items():
         entities.append(AddonInstalledVersionSensor(coordinator, key))
         entities.append(AddonLatestVersionSensor(coordinator, key))
-        _LOGGER.debug("[AUC] Sensoren angelegt für: %s", key)
+        _LOGGER.debug("[AUC] Sensoren angelegt f\u00fcr: %s", key)
 
     async_add_entities(entities)
 
-    # Neue Sensoren bei späteren Updates dynamisch hinzufügen
     def _handle_coordinator_update() -> None:
         new_keys = set(coordinator.data.keys()) - {e._key for e in entities if hasattr(e, '_key')}
         if new_keys:
@@ -40,7 +39,7 @@ async def async_setup_entry(
             for key in new_keys:
                 new_entities.append(AddonInstalledVersionSensor(coordinator, key))
                 new_entities.append(AddonLatestVersionSensor(coordinator, key))
-                _LOGGER.debug("[AUC] Neue Sensoren für neu erkanntes Dockerfile: %s", key)
+                _LOGGER.debug("[AUC] Neue Sensoren f\u00fcr neu erkanntes Dockerfile: %s", key)
             async_add_entities(new_entities)
 
     coordinator.async_add_listener(_handle_coordinator_update)
@@ -52,7 +51,6 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator: AddonUpdateCoordinator, key: str) -> None:
         super().__init__(coordinator)
         self._key = key
-        self._dep = coordinator.data.get(key, {})
 
     @property
     def _current_dep(self) -> dict:
@@ -64,8 +62,7 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
         return {
             "addon_repo": dep.get("addon_repo"),
             "dockerfile_path": dep.get("dockerfile_path"),
-            "upstream_owner": dep.get("upstream_owner"),
-            "upstream_repo": dep.get("upstream_repo"),
+            "upstream": f"{dep.get('upstream_owner')}/{dep.get('upstream_repo')}",
             "status": dep.get("status"),
             "dynamic": dep.get("dynamic"),
             "update_available": dep.get("update_available"),
@@ -73,7 +70,7 @@ class AddonBaseSensor(CoordinatorEntity, SensorEntity):
 
 
 class AddonInstalledVersionSensor(AddonBaseSensor):
-    """Sensor für die aktuell im Dockerfile referenzierte Version."""
+    """Sensor f\u00fcr die aktuell im Dockerfile referenzierte Version."""
 
     @property
     def unique_id(self) -> str:
@@ -88,7 +85,8 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
     def native_value(self) -> str | None:
         dep = self._current_dep
         if dep.get("dynamic"):
-            return "dynamic (always latest)"
+            # Dynamisch = l\u00e4dt immer latest beim Build, keine feste Version hinterlegt
+            return None
         return dep.get("installed_version")
 
     @property
@@ -97,7 +95,7 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
 
 class AddonLatestVersionSensor(AddonBaseSensor):
-    """Sensor für die neueste verfügbare upstream Version."""
+    """Sensor f\u00fcr die neueste verf\u00fcgbare upstream Version."""
 
     @property
     def unique_id(self) -> str:
