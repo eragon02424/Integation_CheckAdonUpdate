@@ -36,10 +36,8 @@ async def async_setup_entry(
         entities.extend(new)
         known_keys.update(keys)
 
-    # Initiale Sensoren
     _add_for_keys(set(coordinator.data.keys()))
 
-    # Dynamisch neue Sensoren hinzufuegen wenn neue Dockerfiles gefunden werden
     def _on_update() -> None:
         new_keys = set(coordinator.data.keys()) - known_keys
         if new_keys:
@@ -85,7 +83,7 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
     @property
     def name(self) -> str:
         d = self._dep
-        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Installed"
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Addon Version"
 
     @property
     def native_value(self) -> str | None:
@@ -98,7 +96,7 @@ class AddonInstalledVersionSensor(AddonBaseSensor):
 
 
 class AddonLatestVersionSensor(AddonBaseSensor):
-    """Zeigt die neueste verfuegbare upstream Version."""
+    """Zeigt die neueste verfuegbare upstream Docker Version."""
 
     @property
     def unique_id(self) -> str:
@@ -107,7 +105,7 @@ class AddonLatestVersionSensor(AddonBaseSensor):
     @property
     def name(self) -> str:
         d = self._dep
-        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Latest"
+        return f"AUC {d.get('addon_name', d.get('addon_repo', ''))} Docker Version"
 
     @property
     def native_value(self) -> str | None:
