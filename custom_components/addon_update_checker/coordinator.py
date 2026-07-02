@@ -9,6 +9,10 @@ from typing import Any
 
 import aiohttp
 import yaml
+from homeassistant.components.persistent_notification import (
+    async_create as pn_create,
+    async_dismiss as pn_dismiss,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -28,11 +32,6 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Regex: externe GitHub Release Links im Dockerfile erkennen
-# Unterstuetzt:
-#   https://github.com/owner/repo/releases/download/v1.2.3/...
-#   https://api.github.com/repos/owner/repo/releases/latest
-#   https://github.com/owner/repo/releases/download/${LATEST}/...
 PATTERN_FIXED = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
@@ -54,7 +53,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MINUTES)
         )
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        # Gespeicherte Versionen: key -> {addon_version, upstream_version}
         self._stored: dict[str, dict] = {}
         self._store_loaded = False
         self.session = async_get_clientsession(hass)
@@ -70,12 +68,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             self.github_username, scan_minutes
         )
 
-    # ------------------------------------------------------------------
-    # Storage
-    # ------------------------------------------------------------------
-
     async def _load_store(self) -> None:
-        """Laedt gespeicherte Versionen aus HA Storage (ueberlebt Neustart)."""
         data = await self._store.async_load()
         if data:
             self._stored = data.get("versions", {})
@@ -85,16 +78,10 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         self._store_loaded = True
 
     async def _save_store(self) -> None:
-        """Speichert Versionen persistent."""
         await self._store.async_save({"versions": self._stored})
         _LOGGER.debug("[AUC] Storage gespeichert: %d Eintraege", len(self._stored))
 
-    # ------------------------------------------------------------------
-    # GitHub HTTP Helpers
-    # ------------------------------------------------------------------
-
     async def _gh_json(self, url: str) -> Any:
-        """GitHub API GET -> JSON."""
         headers = {
             "User-Agent": "HA-AddonUpdateChecker/1.0",
             "Accept": "application/vnd.github+json",
@@ -118,7 +105,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return None
 
     async def _gh_text(self, url: str) -> str | None:
-        """GitHub RAW GET -> Text."""
         headers = {"User-Agent": "HA-AddonUpdateChecker/1.0"}
         try:
             async with self.session.get(
@@ -131,12 +117,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
 
-    # ------------------------------------------------------------------
-    # GitHub Repo/Datei Zugriff
-    # ------------------------------------------------------------------
-
     async def _get_repos(self) -> list[dict]:
-        """Alle Repos des GitHub Users holen."""
         _LOGGER.debug("[AUC] Lade Repos von: %s", self.github_username)
         repos, page = [], 1
         while True:
@@ -153,7 +134,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return repos
 
     async def _find_dockerfiles(self, repo: str, branch: str) -> list[str]:
-        """Alle Dockerfile-Pfade in einem Repo finden."""
         url = f"{GITHUB_API_BASE}/repos/{self.github_username}/{repo}/git/trees/{branch}?recursive=1"
         data = await self._gh_json(url)
         if not data:
@@ -168,94 +148,45 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return paths
 
     async def _read_raw(self, repo: str, branch: str, path: str) -> str | None:
-        """Datei aus GitHub RAW lesen."""
         url = f"{GITHUB_RAW_BASE}/{self.github_username}/{repo}/{branch}/{path}"
         return await self._gh_text(url)
 
-    # ------------------------------------------------------------------
-    # Dockerfile + config.yaml parsen
-    # ------------------------------------------------------------------
-
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
-        """Externe GitHub Abhaengigkeiten aus Dockerfile extrahieren."""
         results = []
-
-        # Feste Version
         for m in PATTERN_FIXED.finditer(content):
-            gh_owner, gh_repo, version = m.group(1), m.group(2), m.group(3)
-            _LOGGER.debug(
-                "[AUC] Feste Version in %s/%s: %s/%s @ %s",
-                repo, path, gh_owner, gh_repo, version
-            )
-            results.append({
-                "upstream_owner": gh_owner,
-                "upstream_repo": gh_repo,
-                "dynamic": False,
-            })
-
-        # Dynamisch via API
+            gh_owner, gh_repo = m.group(1), m.group(2)
+            _LOGGER.debug("[AUC] Feste Version in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
+            results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": False})
         for m in PATTERN_DYNAMIC_API.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            _LOGGER.debug(
-                "[AUC] Dynamischer API-Link in %s/%s: %s/%s",
-                repo, path, gh_owner, gh_repo
-            )
-            results.append({
-                "upstream_owner": gh_owner,
-                "upstream_repo": gh_repo,
-                "dynamic": True,
-            })
-
-        # Dynamisch via Variable
+            _LOGGER.debug("[AUC] Dynamischer API-Link in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
+            results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": True})
         for m in PATTERN_DYNAMIC_VAR.finditer(content):
             gh_owner, gh_repo = m.group(1), m.group(2)
-            # Nicht doppelt erfassen falls schon via API gefunden
-            already = any(
-                r["upstream_owner"] == gh_owner and r["upstream_repo"] == gh_repo
-                for r in results
-            )
-            if not already:
-                _LOGGER.debug(
-                    "[AUC] Dynamische Variable in %s/%s: %s/%s",
-                    repo, path, gh_owner, gh_repo
-                )
-                results.append({
-                    "upstream_owner": gh_owner,
-                    "upstream_repo": gh_repo,
-                    "dynamic": True,
-                })
-
+            if not any(r["upstream_owner"] == gh_owner and r["upstream_repo"] == gh_repo for r in results):
+                _LOGGER.debug("[AUC] Dynamische Variable in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
+                results.append({"upstream_owner": gh_owner, "upstream_repo": gh_repo, "dynamic": True})
         return results
 
     async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
-        """config.yaml im gleichen Ordner wie das Dockerfile lesen."""
         folder = dockerfile_path.rsplit("/", 1)[0] if "/" in dockerfile_path else ""
         config_path = f"{folder}/config.yaml" if folder else "config.yaml"
         _LOGGER.debug("[AUC] Lese config.yaml: %s/%s", repo, config_path)
         content = await self._read_raw(repo, branch, config_path)
         if not content:
-            _LOGGER.debug("[AUC] Keine config.yaml gefunden bei %s/%s", repo, config_path)
             return {}
         try:
             data = yaml.safe_load(content)
-            slug = data.get("slug", "")
-            version = str(data.get("version", ""))
-            name = data.get("name", slug)
-            _LOGGER.debug(
-                "[AUC] config.yaml gelesen: slug=%s, version=%s, name=%s",
-                slug, version, name
-            )
-            return {"slug": slug, "addon_version": version, "addon_name": name}
+            return {
+                "slug": data.get("slug", ""),
+                "addon_version": str(data.get("version", "")),
+                "addon_name": data.get("name", data.get("slug", repo)),
+            }
         except Exception as e:
             _LOGGER.warning("[AUC] Fehler beim Parsen von config.yaml: %s", e)
             return {}
 
-    # ------------------------------------------------------------------
-    # Upstream Version
-    # ------------------------------------------------------------------
-
     async def _get_upstream_latest(self, owner: str, repo: str) -> str | None:
-        """Neueste Release Version von upstream GitHub holen."""
         url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/releases/latest"
         data = await self._gh_json(url)
         if data:
@@ -264,23 +195,13 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             return tag
         return None
 
-    # ------------------------------------------------------------------
-    # Benachrichtigungen
-    # ------------------------------------------------------------------
-
     def _notify(self, notif_id: str, title: str, message: str) -> None:
-        self.hass.components.persistent_notification.async_create(
-            message=message, title=title, notification_id=notif_id
-        )
+        """Persistente HA Benachrichtigung erstellen."""
+        pn_create(self.hass, message=message, title=title, notification_id=notif_id)
 
     def _dismiss(self, notif_id: str) -> None:
-        self.hass.components.persistent_notification.async_dismiss(
-            notification_id=notif_id
-        )
-
-    # ------------------------------------------------------------------
-    # Haupt-Update
-    # ------------------------------------------------------------------
+        """Persistente HA Benachrichtigung entfernen."""
+        pn_dismiss(self.hass, notification_id=notif_id)
 
     async def _async_update_data(self) -> dict:
         """Wird vom Coordinator regelmaessig aufgerufen."""
@@ -314,7 +235,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("[AUC] Keine externen Links in %s/%s", repo, df_path)
                     continue
 
-                # config.yaml lesen fuer slug + addon_version
                 cfg = await self._read_config_yaml(repo, branch, df_path)
                 addon_version = cfg.get("addon_version", "")
                 addon_name = cfg.get("addon_name", repo)
@@ -328,18 +248,14 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     key = f"{repo}__{df_path.replace('/', '_')}__{upstream_owner}__{upstream_repo}"
                     found_keys.add(key)
 
-                    # Upstream latest holen
                     upstream_latest = await self._get_upstream_latest(upstream_owner, upstream_repo)
                     notif_id = f"auc_{key}"
-
                     stored = self._stored.get(key)
 
                     if stored is None:
-                        # Erster Fund - Baseline, keine Warnung
                         _LOGGER.info(
                             "[AUC] ERSTER FUND (Baseline): %s/%s -> %s/%s | addon=%s upstream=%s",
-                            repo, df_path, upstream_owner, upstream_repo,
-                            addon_version, upstream_latest
+                            repo, df_path, upstream_owner, upstream_repo, addon_version, upstream_latest
                         )
                         self._stored[key] = {
                             "addon_version": addon_version,
@@ -352,12 +268,10 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     else:
                         last_upstream = stored.get("upstream_version", "")
                         last_addon = stored.get("addon_version", "")
-
                         addon_changed = addon_version != last_addon
                         upstream_changed = upstream_latest and upstream_latest != last_upstream
 
                         if addon_changed:
-                            # Add-on wurde neu gebaut - Warnung zuruecksetzen, alles speichern
                             _LOGGER.info(
                                 "[AUC] ADD-ON AKTUALISIERT: %s | addon %s -> %s | upstream %s",
                                 addon_name, last_addon, addon_version, upstream_latest
@@ -372,11 +286,9 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                             update_available = False
 
                         elif upstream_changed and not is_dynamic:
-                            # Upstream hat Update, Add-on noch nicht - Warnung!
                             _LOGGER.warning(
-                                "[AUC] UPDATE VERFUEGBAR: %s/%s -> %s/%s: upstream %s -> %s (addon bleibt %s)",
-                                repo, df_path, upstream_owner, upstream_repo,
-                                last_upstream, upstream_latest, addon_version
+                                "[AUC] UPDATE VERFUEGBAR: %s | upstream %s -> %s (addon bleibt %s)",
+                                addon_name, last_upstream, upstream_latest, addon_version
                             )
                             self._stored[key]["upstream_version"] = upstream_latest
                             self._notify(
@@ -394,9 +306,8 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                             update_available = True
 
                         elif is_dynamic and upstream_changed:
-                            # Dynamisches Dockerfile - nur upstream speichern, keine Warnung
                             _LOGGER.info(
-                                "[AUC] Dynamisch, upstream geaendert (kein Vergleich moeglich): %s/%s upstream %s -> %s",
+                                "[AUC] Dynamisch, upstream geaendert: %s/%s upstream %s -> %s",
                                 repo, df_path, last_upstream, upstream_latest
                             )
                             self._stored[key]["upstream_version"] = upstream_latest
@@ -405,9 +316,8 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
                         else:
                             _LOGGER.debug(
-                                "[AUC] OK: %s/%s -> %s/%s | addon=%s upstream=%s",
-                                repo, df_path, upstream_owner, upstream_repo,
-                                addon_version, upstream_latest
+                                "[AUC] OK: %s | addon=%s upstream=%s",
+                                addon_name, addon_version, upstream_latest
                             )
                             self._dismiss(notif_id)
                             status = "up_to_date"
@@ -428,7 +338,6 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         "update_available": update_available,
                     }
 
-        # Nicht mehr vorhandene Eintraege aus Storage entfernen
         removed = [k for k in list(self._stored.keys()) if k not in found_keys]
         for k in removed:
             _LOGGER.info("[AUC] Eintrag entfernt (Dockerfile weg): %s", k)
