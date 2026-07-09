@@ -34,6 +34,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# GitHub Release Links
 PATTERN_FIXED = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/v?([\d][\d\.]*)/'
 )
@@ -43,18 +44,29 @@ PATTERN_DYNAMIC_API = re.compile(
 PATTERN_DYNAMIC_VAR = re.compile(
     r'https://github\.com/([\w.-]+)/([\w.-]+)/releases/download/\$\{?\w+\}?/'
 )
-# Erkennt: pip install --no-cache-dir paketname oder pip install paketname==1.2.3
+
+# PyPI: pip install --no-cache-dir paketname oder pip install paketname==1.2.3
 PATTERN_PYPI = re.compile(
     r'pip(?:3)? install\s+((?:--[\w-]+\s+)*)([^\s&|\\]+)'
 )
 PYPI_IGNORE = {
-    # pip Flags und Metapakete
     "pip", "setuptools", "wheel", "no-cache-dir", "break-system-packages",
     "upgrade", "r", "q", "quiet", "user",
-    # Standard HTTP/Netzwerk Libs - updaten sich zu haeufig, nicht Kernfunktion
     "aiohttp", "requests", "urllib3", "httpx",
-    # Sonstige Standard-Hilfsbibliotheken
     "certifi", "charset-normalizer", "idna", "pyyaml",
+}
+
+# Docker Hub FROM image:tag
+# Erkennt: FROM owner/image:tag oder FROM registry/owner/image:tag
+# Ignoriert: FROM $BUILD_FROM, FROM alpine:3.x, FROM python:x.x-alpine (Standard-Basis-Images)
+PATTERN_DOCKER_FROM = re.compile(
+    r'^FROM\s+(?!\$)([\w.-]+(?:/[\w.-]+)+)(?::([\w.-]+))?\s*$',
+    re.MULTILINE
+)
+# Standard Basis-Images die wir ignorieren
+DOCKER_BASE_IGNORE = {
+    "alpine", "python", "node", "ubuntu", "debian", "golang", "rust",
+    "nginx", "redis", "postgres", "mysql", "mongo", "scratch", "busybox",
 }
 
 
@@ -134,7 +146,8 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
 
-    async def _pypi_json(self, url: str) -> Any:
+    async def _api_json(self, url: str) -> Any:
+        """Generischer JSON GET ohne Auth."""
         try:
             async with self.session.get(
                 url, headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
@@ -142,9 +155,9 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                _LOGGER.debug("[AUC] PyPI HTTP %d bei %s", resp.status, url)
+                _LOGGER.debug("[AUC] HTTP %d bei %s", resp.status, url)
         except Exception as e:
-            _LOGGER.warning("[AUC] PyPI Fehler bei %s: %s", url, e)
+            _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
 
     async def _get_repos(self) -> list[dict]:
@@ -181,10 +194,11 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return await self._gh_text(url)
 
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
-        """Externe Abhaengigkeiten aus Dockerfile extrahieren (GitHub + PyPI)."""
+        """Externe Abhaengigkeiten aus Dockerfile extrahieren (GitHub + PyPI + Docker Hub)."""
         results = []
         seen = set()
 
+        # GitHub Release Links
         for pattern in [PATTERN_FIXED, PATTERN_DYNAMIC_API, PATTERN_DYNAMIC_VAR]:
             for m in pattern.finditer(content):
                 gh_owner, gh_repo = m.group(1), m.group(2)
@@ -194,6 +208,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("[AUC] GitHub erkannt in %s/%s: %s/%s", repo, path, gh_owner, gh_repo)
                     results.append({"type": "github", "upstream_owner": gh_owner, "upstream_repo": gh_repo})
 
+        # PyPI pip install
         for m in PATTERN_PYPI.finditer(content):
             pkg = m.group(2).strip().lower().split('==')[0]
             if pkg in PYPI_IGNORE or len(pkg) < 2 or pkg.startswith('-'):
@@ -203,6 +218,47 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                 seen.add(k)
                 _LOGGER.debug("[AUC] PyPI erkannt in %s/%s: %s", repo, path, pkg)
                 results.append({"type": "pypi", "package": pkg})
+
+        # Docker Hub FROM image
+        for m in PATTERN_DOCKER_FROM.finditer(content):
+            image_full = m.group(1).strip()  # z.B. f0rc3/barcodebuddy oder lscr.io/linuxserver/grocy
+            tag = m.group(2) or "latest"
+
+            # Registry-Prefix entfernen fuer Docker Hub Check
+            parts = image_full.split("/")
+
+            # Entscheide ob Docker Hub oder andere Registry
+            if "." in parts[0] or ":" in parts[0]:
+                # Externe Registry (z.B. lscr.io/linuxserver/grocy)
+                registry = parts[0]
+                image = "/".join(parts[1:])
+                dh_owner = parts[1] if len(parts) > 2 else None
+                dh_image = parts[2] if len(parts) > 2 else parts[1]
+            else:
+                # Docker Hub (z.B. f0rc3/barcodebuddy)
+                registry = "hub.docker.com"
+                image = image_full
+                dh_owner = parts[0] if len(parts) > 1 else "library"
+                dh_image = parts[1] if len(parts) > 1 else parts[0]
+
+            # Standard Basis-Images ignorieren
+            base_name = dh_image.split(":")[0].lower()
+            if base_name in DOCKER_BASE_IGNORE or dh_owner in DOCKER_BASE_IGNORE:
+                _LOGGER.debug("[AUC] Docker Base-Image ignoriert: %s", image_full)
+                continue
+
+            k = f"dh:{image_full}"
+            if k not in seen:
+                seen.add(k)
+                _LOGGER.debug("[AUC] Docker Hub erkannt in %s/%s: %s:%s", repo, path, image_full, tag)
+                results.append({
+                    "type": "dockerhub",
+                    "image_full": image_full,
+                    "dh_owner": dh_owner,
+                    "dh_image": dh_image,
+                    "registry": registry,
+                    "tag": tag,
+                })
 
         return results
 
@@ -234,11 +290,31 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
     async def _get_pypi_latest(self, package: str) -> str | None:
         url = f"{PYPI_API_BASE}/{package}/json"
-        data = await self._pypi_json(url)
+        data = await self._api_json(url)
         if data:
             version = data.get("info", {}).get("version", "")
             _LOGGER.debug("[AUC] PyPI %s latest: %s", package, version)
             return version
+        return None
+
+    async def _get_dockerhub_digest(self, dh_owner: str, dh_image: str, tag: str, registry: str) -> str | None:
+        """Holt den aktuellen Digest eines Docker Images via Docker Hub API."""
+        if registry == "hub.docker.com":
+            url = f"https://hub.docker.com/v2/repositories/{dh_owner}/{dh_image}/tags/{tag}"
+        else:
+            # linuxserver und andere registries: versuche Docker Hub API
+            url = f"https://hub.docker.com/v2/repositories/{dh_owner}/{dh_image}/tags/{tag}"
+
+        data = await self._api_json(url)
+        if data:
+            # Digest aus dem neuesten Image
+            images = data.get("images", [])
+            if images:
+                digest = images[0].get("digest", "")[:19]  # Kurz: sha256:abc123...
+                last_updated = data.get("last_updated", "")
+                _LOGGER.debug("[AUC] Docker Hub %s/%s:%s digest=%s updated=%s",
+                              dh_owner, dh_image, tag, digest, last_updated)
+                return last_updated  # Wir vergleichen last_updated als "Version"
         return None
 
     def _notify(self, notif_id: str, title: str, message: str) -> None:
@@ -277,15 +353,17 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                 notif_id,
                 f"\U0001f527 Add-on Update: {addon_name}",
                 (f"**{addon_name}** (`{slug}`) verwendet\n"
-                 f"`{source_label}` in Version **{last_upstream}**,\n"
-                 f"aber **{upstream_latest}** ist verfuegbar.\n\n"
-                 f"Bitte Dockerfile anpassen und Add-on neu aufbauen.\n"
+                 f"`{source_label}` in Version **{last_upstream[:16] if last_upstream else '?'}**,\n"
+                 f"aber eine neuere Version ist verfuegbar (Stand: **{upstream_latest[:16] if upstream_latest else '?'}**).\n\n"
+                 f"Bitte Dockerfile pruefen und Add-on neu aufbauen.\n"
                  f"Diese Meldung verschwindet automatisch nach dem Update."),
             )
             return "update_available", True
 
         else:
-            _LOGGER.debug("[AUC] OK: %s | addon=%s upstream=%s", addon_name, addon_version, upstream_latest)
+            _LOGGER.debug("[AUC] OK: %s | addon=%s upstream=%s",
+                          addon_name, addon_version,
+                          upstream_latest[:16] if upstream_latest else None)
             self._dismiss(notif_id)
             return "up_to_date", False
 
@@ -324,17 +402,28 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
                 for dep in deps:
                     dep_type = dep["type"]
+
                     if dep_type == "github":
                         upstream_owner = dep["upstream_owner"]
                         upstream_repo = dep["upstream_repo"]
                         key = f"{repo}__{df_path.replace('/', '_')}__gh__{upstream_owner}__{upstream_repo}"
                         source_label = f"{upstream_owner}/{upstream_repo}"
                         upstream_latest = await self._get_github_latest(upstream_owner, upstream_repo)
+
                     elif dep_type == "pypi":
                         package = dep["package"]
                         key = f"{repo}__{df_path.replace('/', '_')}__py__{package}"
                         source_label = f"pypi:{package}"
                         upstream_latest = await self._get_pypi_latest(package)
+
+                    elif dep_type == "dockerhub":
+                        image_full = dep["image_full"]
+                        key = f"{repo}__{df_path.replace('/', '_')}__dh__{image_full.replace('/', '_').replace('.', '_')}"
+                        source_label = f"docker:{image_full}"
+                        upstream_latest = await self._get_dockerhub_digest(
+                            dep["dh_owner"], dep["dh_image"], dep["tag"], dep["registry"]
+                        )
+
                     else:
                         continue
 
