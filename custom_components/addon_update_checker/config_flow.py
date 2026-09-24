@@ -9,9 +9,11 @@ from homeassistant import config_entries
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
+    CONF_AUTO_BUMP,
     CONF_GITHUB_TOKEN,
     CONF_GITHUB_USERNAME,
     CONF_SCAN_INTERVAL,
+    DEFAULT_AUTO_BUMP,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DOMAIN,
     GITHUB_API_BASE,
@@ -104,11 +106,14 @@ class AddonUpdateCheckerOptionsFlow(config_entries.OptionsFlow):
             self.config_entry.data.get(CONF_GITHUB_TOKEN, "")
         )
 
+        current_auto_bump = self.config_entry.options.get(CONF_AUTO_BUMP, DEFAULT_AUTO_BUMP)
+
         schema = vol.Schema({
             vol.Optional(CONF_GITHUB_TOKEN, default=current_token): str,
             vol.Required(CONF_SCAN_INTERVAL, default=current_interval): vol.All(
                 int, vol.Range(min=MIN_SCAN_INTERVAL_MINUTES, max=MAX_SCAN_INTERVAL_MINUTES)
             ),
+            vol.Required(CONF_AUTO_BUMP, default=current_auto_bump): bool,
         })
 
         return self.async_show_form(step_id="init", data_schema=schema)
