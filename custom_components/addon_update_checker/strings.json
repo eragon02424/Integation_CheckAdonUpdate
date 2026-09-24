@@ -24,10 +24,11 @@
     "step": {
       "init": {
         "title": "Einstellungen anpassen",
-        "description": "Token aendern oder Scan-Intervall anpassen.",
+        "description": "Token aendern, Scan-Intervall anpassen, Auto-Bump ein/aus.\n\nAuto-Bump: Bei neuer Upstream-Version wird die Add-on-Version in config.yaml automatisch erhoeht (GitHub-Commit, Token braucht Contents: Read & Write) und der Add-on-Store neu geladen. Das Update erscheint dann unter Einstellungen → Updates.",
         "data": {
           "github_token": "GitHub Token (optional)",
-          "scan_interval": "Scan-Intervall (1 Min = 1, 1 Std = 60, 24 Std = 1440)"
+          "scan_interval": "Scan-Intervall (1 Min = 1, 1 Std = 60, 24 Std = 1440)",
+          "auto_bump": "Auto-Bump: Add-on-Version bei Upstream-Update automatisch erhoehen"
         }
       }
     }
