@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import os
 import re
 from datetime import timedelta
 from typing import Any
 
 import aiohttp
 import yaml
+from awesomeversion import AwesomeVersion
 from homeassistant.components.persistent_notification import (
     async_create as pn_create,
     async_dismiss as pn_dismiss,
@@ -20,9 +23,11 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_AUTO_BUMP,
     CONF_GITHUB_TOKEN,
     CONF_GITHUB_USERNAME,
     CONF_SCAN_INTERVAL,
+    DEFAULT_AUTO_BUMP,
     DEFAULT_SCAN_INTERVAL_MINUTES,
     DOMAIN,
     GITHUB_API_BASE,
@@ -69,19 +74,32 @@ DOCKER_BASE_IGNORE = {
     "nginx", "redis", "postgres", "mysql", "mongo", "scratch", "busybox",
 }
 
+# Auto-Bump: version-Zeile in config.yaml (nur x.y.z)
+PATTERN_CFG_VERSION = re.compile(
+    r'^(version:\s*["\']?)(\d+)\.(\d+)\.(\d+)(["\']?\s*)$', re.MULTILINE
+)
+# Cache-Buster: Supervisor uebergibt beim Build --build-arg BUILD_VERSION=<version>.
+# Ist ARG BUILD_VERSION im Dockerfile deklariert, invalidiert eine neue Version den
+# Docker-Build-Cache aller folgenden RUN-Schritte (curl/pip holen dann wirklich neu).
+CACHE_BUSTER = "ARG BUILD_VERSION"
+
 
 class AddonUpdateCoordinator(DataUpdateCoordinator):
     """Koordiniert alle GitHub Scans und Versionsvergleiche."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.github_username = entry.data[CONF_GITHUB_USERNAME]
-        self.github_token = entry.data.get(CONF_GITHUB_TOKEN, "").strip()
+        self.github_token = str(entry.options.get(
+            CONF_GITHUB_TOKEN, entry.data.get(CONF_GITHUB_TOKEN, "")
+        )).strip()
         scan_minutes = entry.options.get(
             CONF_SCAN_INTERVAL,
             entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_MINUTES)
         )
+        self.auto_bump = bool(entry.options.get(CONF_AUTO_BUMP, DEFAULT_AUTO_BUMP))
         self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._stored: dict[str, dict] = {}
+        self._pending: dict[str, dict] = {}  # slug -> {"target": ver, "name": ...}
         self._store_loaded = False
         self.session = async_get_clientsession(hass)
         super().__init__(
@@ -89,24 +107,30 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=scan_minutes),
         )
         auth_info = "mit Token" if self.github_token else "OHNE Token (Rate Limit: 60/h)"
-        _LOGGER.debug("[AUC] Coordinator init: user=%s, intervall=%d min, auth=%s",
-                      self.github_username, scan_minutes, auth_info)
+        _LOGGER.debug("[AUC] Coordinator init: user=%s, intervall=%d min, auth=%s, auto_bump=%s",
+                      self.github_username, scan_minutes, auth_info, self.auto_bump)
 
+    # ------------------------------------------------------------------ Storage
     async def _load_store(self) -> None:
         data = await self._store.async_load()
         if data:
             self._stored = data.get("versions", {})
-            _LOGGER.debug("[AUC] Storage geladen: %d Eintraege", len(self._stored))
+            self._pending = data.get("pending_installs", {})
+            _LOGGER.debug("[AUC] Storage geladen: %d Eintraege, %d offene Installationen",
+                          len(self._stored), len(self._pending))
         else:
             _LOGGER.debug("[AUC] Kein Storage vorhanden, starte frisch")
         self._store_loaded = True
 
     async def _save_store(self) -> None:
-        await self._store.async_save({"versions": self._stored})
+        await self._store.async_save(
+            {"versions": self._stored, "pending_installs": self._pending}
+        )
         _LOGGER.debug("[AUC] Storage gespeichert: %d Eintraege", len(self._stored))
 
+    # ------------------------------------------------------------------ HTTP
     def _github_headers(self) -> dict:
-        headers = {"User-Agent": "HA-AddonUpdateChecker/1.0",
+        headers = {"User-Agent": "HA-AddonUpdateChecker/1.1",
                    "Accept": "application/vnd.github+json"}
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
@@ -133,10 +157,24 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[AUC] Verbindungsfehler %s: %s", url, e)
         return None
 
+    async def _gh_put(self, url: str, payload: dict) -> tuple[int, Any]:
+        try:
+            async with self.session.put(
+                url, headers=self._github_headers(), json=payload,
+                timeout=aiohttp.ClientTimeout(total=20)
+            ) as resp:
+                try:
+                    body = await resp.json()
+                except Exception:
+                    body = await resp.text()
+                return resp.status, body
+        except Exception as e:
+            return 0, str(e)
+
     async def _gh_text(self, url: str) -> str | None:
         try:
             async with self.session.get(
-                url, headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
+                url, headers={"User-Agent": "HA-AddonUpdateChecker/1.1"},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
@@ -150,7 +188,7 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         """Generischer JSON GET ohne Auth."""
         try:
             async with self.session.get(
-                url, headers={"User-Agent": "HA-AddonUpdateChecker/1.0"},
+                url, headers={"User-Agent": "HA-AddonUpdateChecker/1.1"},
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 if resp.status == 200:
@@ -160,6 +198,53 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("[AUC] Fehler bei %s: %s", url, e)
         return None
 
+    # ------------------------------------------------------------------ Supervisor
+    def _supervisor_base(self) -> tuple[str, dict] | None:
+        token = os.environ.get("SUPERVISOR_TOKEN")
+        host = os.environ.get("SUPERVISOR")
+        if not token or not host:
+            return None
+        return f"http://{host}", {"Authorization": f"Bearer {token}"}
+
+    async def _get_installed_addons(self) -> dict[str, dict] | None:
+        """Liefert {config-slug: {"full_slug", "version"}} der installierten Add-ons."""
+        base = self._supervisor_base()
+        if not base:
+            return None
+        url, headers = base
+        try:
+            async with self.session.get(
+                f"{url}/addons", headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.warning("[AUC] Supervisor /addons HTTP %d", resp.status)
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            _LOGGER.warning("[AUC] Supervisor nicht erreichbar: %s", e)
+            return None
+        result: dict[str, dict] = {}
+        for addon in data.get("data", {}).get("addons", []):
+            full = addon.get("slug", "")
+            short = full.split("_", 1)[1] if "_" in full else full
+            result[short] = {"full_slug": full, "version": str(addon.get("version", ""))}
+        return result
+
+    async def _supervisor_store_reload(self) -> None:
+        base = self._supervisor_base()
+        if not base:
+            return
+        url, headers = base
+        try:
+            async with self.session.post(
+                f"{url}/store/reload", headers=headers,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                _LOGGER.info("[AUC] Supervisor store/reload -> HTTP %d", resp.status)
+        except Exception as e:
+            _LOGGER.warning("[AUC] store/reload fehlgeschlagen: %s", e)
+
+    # ------------------------------------------------------------------ GitHub Scan
     async def _get_repos(self) -> list[dict]:
         _LOGGER.debug("[AUC] Lade Repos von: %s", self.github_username)
         repos, page = [], 1
@@ -193,6 +278,15 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         url = f"{GITHUB_RAW_BASE}/{self.github_username}/{repo}/{branch}/{path}"
         return await self._gh_text(url)
 
+    async def _get_contents(self, repo: str, branch: str, path: str) -> tuple[str, str] | None:
+        """Datei ueber Contents-API (ohne CDN-Cache). Liefert (text, sha)."""
+        url = f"{GITHUB_API_BASE}/repos/{self.github_username}/{repo}/contents/{path}?ref={branch}"
+        data = await self._gh_json(url)
+        if not data or "content" not in data:
+            return None
+        text = base64.b64decode(data["content"]).decode("utf-8")
+        return text, data["sha"]
+
     def _parse_dockerfile(self, content: str, repo: str, path: str) -> list[dict]:
         """Externe Abhaengigkeiten aus Dockerfile extrahieren (GitHub + PyPI + Docker Hub)."""
         results = []
@@ -221,27 +315,19 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
         # Docker Hub FROM image
         for m in PATTERN_DOCKER_FROM.finditer(content):
-            image_full = m.group(1).strip()  # z.B. f0rc3/barcodebuddy oder lscr.io/linuxserver/grocy
+            image_full = m.group(1).strip()
             tag = m.group(2) or "latest"
-
-            # Registry-Prefix entfernen fuer Docker Hub Check
             parts = image_full.split("/")
 
-            # Entscheide ob Docker Hub oder andere Registry
             if "." in parts[0] or ":" in parts[0]:
-                # Externe Registry (z.B. lscr.io/linuxserver/grocy)
                 registry = parts[0]
-                image = "/".join(parts[1:])
                 dh_owner = parts[1] if len(parts) > 2 else None
                 dh_image = parts[2] if len(parts) > 2 else parts[1]
             else:
-                # Docker Hub (z.B. f0rc3/barcodebuddy)
                 registry = "hub.docker.com"
-                image = image_full
                 dh_owner = parts[0] if len(parts) > 1 else "library"
                 dh_image = parts[1] if len(parts) > 1 else parts[0]
 
-            # Standard Basis-Images ignorieren
             base_name = dh_image.split(":")[0].lower()
             if base_name in DOCKER_BASE_IGNORE or dh_owner in DOCKER_BASE_IGNORE:
                 _LOGGER.debug("[AUC] Docker Base-Image ignoriert: %s", image_full)
@@ -262,10 +348,19 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
 
         return results
 
-    async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
+    @staticmethod
+    def _config_path(dockerfile_path: str) -> str:
         folder = dockerfile_path.rsplit("/", 1)[0] if "/" in dockerfile_path else ""
-        config_path = f"{folder}/config.yaml" if folder else "config.yaml"
-        content = await self._read_raw(repo, branch, config_path)
+        return f"{folder}/config.yaml" if folder else "config.yaml"
+
+    async def _read_config_yaml(self, repo: str, branch: str, dockerfile_path: str) -> dict:
+        config_path = self._config_path(dockerfile_path)
+        content = None
+        if self.github_token:
+            got = await self._get_contents(repo, branch, config_path)
+            content = got[0] if got else None
+        if content is None:
+            content = await self._read_raw(repo, branch, config_path)
         if not content:
             return {}
         try:
@@ -298,31 +393,39 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         return None
 
     async def _get_dockerhub_digest(self, dh_owner: str, dh_image: str, tag: str, registry: str) -> str | None:
-        """Holt den aktuellen Digest eines Docker Images via Docker Hub API."""
-        if registry == "hub.docker.com":
-            url = f"https://hub.docker.com/v2/repositories/{dh_owner}/{dh_image}/tags/{tag}"
-        else:
-            # linuxserver und andere registries: versuche Docker Hub API
-            url = f"https://hub.docker.com/v2/repositories/{dh_owner}/{dh_image}/tags/{tag}"
-
+        """Holt last_updated eines Docker Image Tags via Docker Hub API."""
+        url = f"https://hub.docker.com/v2/repositories/{dh_owner}/{dh_image}/tags/{tag}"
         data = await self._api_json(url)
         if data:
-            # Digest aus dem neuesten Image
             images = data.get("images", [])
             if images:
-                digest = images[0].get("digest", "")[:19]  # Kurz: sha256:abc123...
                 last_updated = data.get("last_updated", "")
-                _LOGGER.debug("[AUC] Docker Hub %s/%s:%s digest=%s updated=%s",
-                              dh_owner, dh_image, tag, digest, last_updated)
-                return last_updated  # Wir vergleichen last_updated als "Version"
+                _LOGGER.debug("[AUC] Docker Hub %s/%s:%s updated=%s",
+                              dh_owner, dh_image, tag, last_updated)
+                return last_updated
         return None
 
+    # ------------------------------------------------------------------ Notifications
     def _notify(self, notif_id: str, title: str, message: str) -> None:
         pn_create(self.hass, message=message, title=title, notification_id=notif_id)
 
     def _dismiss(self, notif_id: str) -> None:
         pn_dismiss(self.hass, notification_id=notif_id)
 
+    def _notify_manual(self, notif_id: str, addon_name: str, slug: str, source_label: str,
+                       last_upstream: str | None, upstream_latest: str | None,
+                       extra: str = "") -> None:
+        self._notify(
+            notif_id,
+            f"\U0001f527 Add-on Update: {addon_name}",
+            (f"**{addon_name}** (`{slug}`) verwendet\n"
+             f"`{source_label}` in Version **{last_upstream[:16] if last_upstream else '?'}**,\n"
+             f"aber eine neuere Version ist verfuegbar (Stand: **{upstream_latest[:16] if upstream_latest else '?'}**).\n\n"
+             f"Bitte Dockerfile pruefen und Add-on neu aufbauen.\n"
+             f"Diese Meldung verschwindet automatisch nach dem Update.{extra}"),
+        )
+
+    # ------------------------------------------------------------------ Vergleich
     def _process_dep(
         self, key: str, notif_id: str, addon_name: str, slug: str,
         source_label: str, addon_version: str, upstream_latest: str | None
@@ -346,27 +449,107 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
             self._dismiss(notif_id)
             return "up_to_date", False
 
-        elif upstream_changed:
+        if upstream_changed:
             _LOGGER.warning("[AUC] UPDATE VERFUEGBAR: %s | %s: %s -> %s (addon bleibt %s)",
                             addon_name, source_label, last_upstream, upstream_latest, addon_version)
-            self._notify(
-                notif_id,
-                f"\U0001f527 Add-on Update: {addon_name}",
-                (f"**{addon_name}** (`{slug}`) verwendet\n"
-                 f"`{source_label}` in Version **{last_upstream[:16] if last_upstream else '?'}**,\n"
-                 f"aber eine neuere Version ist verfuegbar (Stand: **{upstream_latest[:16] if upstream_latest else '?'}**).\n\n"
-                 f"Bitte Dockerfile pruefen und Add-on neu aufbauen.\n"
-                 f"Diese Meldung verschwindet automatisch nach dem Update."),
-            )
+            if not self.auto_bump:
+                self._notify_manual(notif_id, addon_name, slug, source_label,
+                                    last_upstream, upstream_latest)
             return "update_available", True
 
-        else:
-            _LOGGER.debug("[AUC] OK: %s | addon=%s upstream=%s",
-                          addon_name, addon_version,
-                          upstream_latest[:16] if upstream_latest else None)
-            self._dismiss(notif_id)
-            return "up_to_date", False
+        _LOGGER.debug("[AUC] OK: %s | addon=%s upstream=%s",
+                      addon_name, addon_version,
+                      upstream_latest[:16] if upstream_latest else None)
+        self._dismiss(notif_id)
+        return "up_to_date", False
 
+    # ------------------------------------------------------------------ Auto-Bump
+    @staticmethod
+    def _add_cache_buster(dockerfile: str) -> str:
+        """Fuegt nach jeder FROM-Zeile 'ARG BUILD_VERSION' ein, falls noch nicht vorhanden."""
+        lines = dockerfile.split("\n")
+        out: list[str] = []
+        for i, line in enumerate(lines):
+            out.append(line)
+            if re.match(r"^\s*FROM\s", line, re.IGNORECASE):
+                nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                if nxt != CACHE_BUSTER:
+                    out.append(CACHE_BUSTER)
+        return "\n".join(out)
+
+    async def _bump_addon(self, repo: str, branch: str, df_path: str, slug: str,
+                          changes: list[str]) -> tuple[str | None, str]:
+        """Erhoeht Patch-Version in config.yaml (+ Cache-Buster im Dockerfile).
+
+        Rueckgabe: (neue_version | None, fehlertext)
+        """
+        if not self.github_token:
+            return None, "kein GitHub Token konfiguriert"
+
+        cfg_path = self._config_path(df_path)
+        api = f"{GITHUB_API_BASE}/repos/{self.github_username}/{repo}/contents"
+
+        # 1) Dockerfile: Cache-Buster sicherstellen (eigener Commit, vor dem Bump)
+        df = await self._get_contents(repo, branch, df_path)
+        if df is None:
+            return None, f"{df_path} nicht lesbar"
+        df_text, df_sha = df
+        new_df = self._add_cache_buster(df_text)
+        if new_df != df_text:
+            status, body = await self._gh_put(f"{api}/{df_path}", {
+                "message": f"{slug}: ARG BUILD_VERSION als Docker-Cache-Buster ergaenzt",
+                "content": base64.b64encode(new_df.encode("utf-8")).decode("ascii"),
+                "sha": df_sha, "branch": branch,
+            })
+            if status not in (200, 201):
+                return None, f"Dockerfile-Commit HTTP {status}: {str(body)[:200]}"
+            _LOGGER.info("[AUC] Cache-Buster in %s/%s ergaenzt", repo, df_path)
+
+        # 2) config.yaml: Patch-Version +1
+        cfg = await self._get_contents(repo, branch, cfg_path)
+        if cfg is None:
+            return None, f"{cfg_path} nicht lesbar"
+        cfg_text, cfg_sha = cfg
+        m = PATTERN_CFG_VERSION.search(cfg_text)
+        if not m:
+            return None, "keine version im Format x.y.z in config.yaml"
+        old_v = f"{m.group(2)}.{m.group(3)}.{m.group(4)}"
+        new_v = f"{m.group(2)}.{m.group(3)}.{int(m.group(4)) + 1}"
+        new_cfg = (cfg_text[:m.start()]
+                   + f"{m.group(1)}{new_v}{m.group(5)}"
+                   + cfg_text[m.end():])
+        msg = f"{slug}: Auto-Bump {old_v} -> {new_v}\n\nUpstream-Aenderungen:\n" + \
+              "\n".join(f"- {c}" for c in changes)
+        status, body = await self._gh_put(f"{api}/{cfg_path}", {
+            "message": msg,
+            "content": base64.b64encode(new_cfg.encode("utf-8")).decode("ascii"),
+            "sha": cfg_sha, "branch": branch,
+        })
+        if status not in (200, 201):
+            return None, f"config.yaml-Commit HTTP {status}: {str(body)[:200]}"
+        _LOGGER.warning("[AUC] AUTO-BUMP: %s %s -> %s", slug, old_v, new_v)
+        return new_v, ""
+
+    def _check_pending(self, installed: dict[str, dict] | None) -> None:
+        """Bump-Meldung entfernen, sobald die Zielversion installiert ist."""
+        if installed is None:
+            return
+        for slug in list(self._pending):
+            target = self._pending[slug].get("target", "")
+            inst = installed.get(slug)
+            if inst is None:
+                done = True  # deinstalliert
+            else:
+                try:
+                    done = AwesomeVersion(inst["version"]) >= AwesomeVersion(target)
+                except Exception:
+                    done = inst["version"] == target
+            if done:
+                _LOGGER.info("[AUC] Installation erkannt: %s -> %s", slug, target)
+                self._dismiss(f"auc_bump_{slug}")
+                del self._pending[slug]
+
+    # ------------------------------------------------------------------ Haupt-Scan
     async def _async_update_data(self) -> dict:
         _LOGGER.debug("[AUC] ===== Scan Start =====")
         if not self._store_loaded:
@@ -376,8 +559,12 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
         if not repos:
             raise UpdateFailed("Konnte keine Repos abrufen")
 
+        installed = await self._get_installed_addons()
+        self._check_pending(installed)
+
         result: dict[str, dict] = {}
         found_keys: set[str] = set()
+        bump_candidates: dict[tuple[str, str, str], dict] = {}
 
         for repo_data in repos:
             repo = repo_data["name"]
@@ -442,6 +629,62 @@ class AddonUpdateCoordinator(DataUpdateCoordinator):
                         "upstream_latest": upstream_latest,
                         "status": status, "update_available": update_available,
                     }
+                    if update_available and self.auto_bump:
+                        cand = bump_candidates.setdefault((repo, branch, df_path), {
+                            "addon_name": addon_name, "slug": slug,
+                            "addon_version": addon_version, "deps": [],
+                        })
+                        cand["deps"].append({
+                            "key": key, "notif_id": notif_id, "label": source_label,
+                            "old": self._stored.get(key, {}).get("upstream_version"),
+                            "new": upstream_latest,
+                        })
+
+        # --- Auto-Bump ausfuehren
+        bumped_any = False
+        for (repo, branch, df_path), cand in bump_candidates.items():
+            slug, name = cand["slug"], cand["addon_name"]
+            changes = [f"{d['label']}: {(d['old'] or '?')[:19]} -> {(d['new'] or '?')[:19]}"
+                       for d in cand["deps"]]
+
+            if installed is not None and slug not in installed:
+                # Nicht installiert: nur neue Baseline merken, nichts bauen
+                _LOGGER.info("[AUC] %s nicht installiert - kein Auto-Bump, Baseline aktualisiert", slug)
+                for d in cand["deps"]:
+                    self._stored[d["key"]] = {"addon_version": cand["addon_version"],
+                                              "upstream_version": d["new"]}
+                    self._dismiss(d["notif_id"])
+                    result[d["key"]].update(status="not_installed", update_available=False)
+                continue
+
+            new_v, err = await self._bump_addon(repo, branch, df_path, slug, changes)
+            if new_v is None:
+                _LOGGER.error("[AUC] Auto-Bump %s fehlgeschlagen: %s", slug, err)
+                for d in cand["deps"]:
+                    self._notify_manual(d["notif_id"], name, slug, d["label"], d["old"], d["new"],
+                                        extra=f"\n\n⚠️ Automatischer Versions-Bump fehlgeschlagen: {err}")
+                continue
+
+            bumped_any = True
+            for d in cand["deps"]:
+                self._stored[d["key"]] = {"addon_version": new_v, "upstream_version": d["new"]}
+                self._dismiss(d["notif_id"])
+                result[d["key"]].update(status="bumped", addon_version=new_v)
+            self._pending[slug] = {"target": new_v, "name": name}
+            self._notify(
+                f"auc_bump_{slug}",
+                f"⬆️ Add-on Update bereit: {name}",
+                (f"**{name}** (`{slug}`) – neue Upstream-Version erkannt:\n"
+                 + "\n".join(f"- `{c}`" for c in changes)
+                 + f"\n\nDie Add-on-Version wurde automatisch von **{cand['addon_version']}** "
+                   f"auf **{new_v}** erhoeht (Commit in `{repo}`).\n"
+                   f"Unter **Einstellungen → Updates** erscheint das Update – dort *Aktualisieren* "
+                   f"klicken, dann wird das Add-on neu gebaut und zieht die aktuellen Versionen.\n\n"
+                   f"Diese Meldung verschwindet automatisch nach der Installation."),
+            )
+
+        if bumped_any:
+            await self._supervisor_store_reload()
 
         removed = [k for k in list(self._stored.keys()) if k not in found_keys]
         for k in removed:
